@@ -19,7 +19,7 @@ local DEFAULTS = {
   height = 18,
   spacing = 4,
   locked = true,
-  showInactive = false,
+  showInactive = true,
 }
 
 local FB = {
@@ -431,7 +431,7 @@ local function CreateOptions()
       local radians = angle * math.pi / 180
       local minimapWidth = type(Minimap.GetWidth) == "function" and Minimap:GetWidth() or 140
       local buttonWidth = type(button.GetWidth) == "function" and button:GetWidth() or 32
-      local radius = math.max(0, minimapWidth / 2 - buttonWidth / 2 - 4)
+      local radius = math.max(0, minimapWidth / 2 + buttonWidth / 2 - 2)
       button:ClearAllPoints()
       button:SetPoint("CENTER", Minimap, "CENTER",
         math.cos(radians) * radius, math.sin(radians) * radius)
@@ -570,6 +570,10 @@ ev:SetScript("OnEvent", function(self, e, a1)
     if type(RoguetimerDB.settingsVersion) ~= "number" or RoguetimerDB.settingsVersion < 1 then
       RoguetimerDB.locked = DEFAULTS.locked
       RoguetimerDB.settingsVersion = 1
+    end
+    if RoguetimerDB.settingsVersion < 2 then
+      RoguetimerDB.showInactive = DEFAULTS.showInactive
+      RoguetimerDB.settingsVersion = 2
     end
     for k, v in pairs(DEFAULTS) do
       if RoguetimerDB[k] == nil then RoguetimerDB[k] = v end

@@ -2,7 +2,7 @@
 ## Title: Roguetimer
 ## Notes: Rogue timers for Slice and Dice, Rupture, Garrote, and Expose Armor
 ## Author: -
-## Version: 0.1.2
+## Version: 0.1.3
 ## SavedVariables: RoguetimerDB, ForeverBarsDB
 
 Roguetimer.lua
