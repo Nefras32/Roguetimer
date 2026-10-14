@@ -20,6 +20,8 @@ local DEFAULTS = {
   spacing = 4,
   locked = true,
   showInactive = false,
+  showBackground = false,
+  backgroundAlpha = 0.24,
 }
 
 local FB = {
@@ -46,36 +48,52 @@ local function GetCP()
   return GetComboPoints("player", "target") or 0
 end
 
-local function TargetDebuff(def)
-  if type(UnitDebuff) ~= "function" then return false end
-  for i = 1, 40 do
-    local texture, _, _, duration, expiration = UnitDebuff("target", i)
-    if not texture then break end
-    if string.find(texture, def.tex, 1, true) then
-      if type(duration) == "number" and type(expiration) == "number" and expiration > 0 then
-        return true, duration, expiration
-      end
-      return true
-    end
+local function AuraInfo(unit, index, auraFunction, def)
+  local a, b, c, duration, expiration = auraFunction(unit, index)
+  if not a then return false, nil, nil, false end
+  local matches = type(a) == "string" and string.find(a, def.tex, 1, true) ~= nil
+  if not matches and type(b) == "string" then matches = string.find(b, def.tex, 1, true) ~= nil end
+  if not matches and type(c) == "string" then matches = string.find(c, def.tex, 1, true) ~= nil end
+  if not matches then return false, nil, nil, true end
+  if type(duration) == "number" and duration > 0
+    and type(expiration) == "number" and expiration > 0 then
+    return true, duration, expiration, true
   end
-  return false
+  return true, nil, nil, true
 end
 
-local function SnDLeft()
-  if type(GetPlayerBuff) ~= "function"
-    or type(GetPlayerBuffTexture) ~= "function"
-    or type(GetPlayerBuffTimeLeft) ~= "function" then
-    return 0
+local function FindAura(unit, auraFunction, def)
+  if type(auraFunction) ~= "function" then return false, nil, nil end
+  for i = 1, 40 do
+    local present, duration, expiration, hasAura = AuraInfo(unit, i, auraFunction, def)
+    if present then return true, duration, expiration end
+    if not hasAura then break end
+  end
+  return false, nil, nil
+end
+
+local function PlayerBuff(def)
+  local present, duration, expiration = FindAura("player", UnitBuff, def)
+  if present then return true, duration, expiration end
+  if def.key ~= "SND" or type(GetPlayerBuff) ~= "function"
+    or type(GetPlayerBuffTexture) ~= "function" then
+    return false, nil, nil
   end
   for i = 0, 31 do
-    local idx = GetPlayerBuff(i, "HELPFUL")
-    if not idx or idx < 0 then break end
-    local t = GetPlayerBuffTexture(idx)
-    if t and string.find(t, "Ability_Rogue_SliceDice", 1, true) then
-      return GetPlayerBuffTimeLeft(idx) or 0
+    local index = GetPlayerBuff(i, "HELPFUL")
+    if not index or index < 0 then break end
+    local texture = GetPlayerBuffTexture(index)
+    if type(texture) == "string" and string.find(texture, def.tex, 1, true) then
+      if type(GetPlayerBuffTimeLeft) == "function" then
+        local remaining = GetPlayerBuffTimeLeft(index)
+        if type(remaining) == "number" and remaining > 0 then
+          return true, nil, GetTime() + remaining
+        end
+      end
+      return true, nil, nil
     end
   end
-  return 0
+  return false, nil, nil
 end
 
 local function ScanTalents()
@@ -98,28 +116,44 @@ end
 -- Debuff timer logic (throttled to about five checks per second).
 ------------------------------------------------------------
 local function CheckTargetAuras()
-  if type(UnitExists) ~= "function" or not UnitExists("target") then return end
-  local name = UnitName("target")
+  if type(UnitExists) ~= "function" or type(UnitName) ~= "function" then return end
   local now = GetTime()
-  if not name then return end
-  FB.timers[name] = FB.timers[name] or {}
-  local timers = FB.timers[name]
-
-  for _, def in ipairs(DEFS) do
-    local present, duration, expiration = TargetDebuff(def)
-    if present then
-      if type(expiration) == "number" and expiration > now and type(duration) == "number" and duration > 0 then
-        timers[def.key] = { start = expiration - duration, dur = duration }
-      elseif not timers[def.key] or now > timers[def.key].start + timers[def.key].dur then
-        local cp = def.scaled and GetCP() or 0
-        timers[def.key] = { start = now, dur = Duration(def, cp) }
-      end
-    else
-      timers[def.key] = nil
-    end
+  local targetExists = UnitExists("target")
+  local units = {
+    { token = "player", name = UnitName("player"), auraFunction = UnitBuff },
+  }
+  if targetExists then
+    table.insert(units, { token = "target", name = UnitName("target"), auraFunction = UnitDebuff })
   end
 
-  if type(UnitIsDead) == "function" and UnitIsDead("target") then FB.timers[name] = nil end
+  for _, unit in ipairs(units) do
+    local name = unit.name or unit.token
+    FB.timers[name] = FB.timers[name] or {}
+    local timers = FB.timers[name]
+    for _, def in ipairs(DEFS) do
+      local shouldScan = (unit.token == "player" and def.key == "SND")
+        or (unit.token == "target" and def.key ~= "SND")
+      if shouldScan then
+        local present, duration, expiration = FindAura(unit.token, unit.auraFunction, def)
+        if unit.token == "player" and not present then
+          present, duration, expiration = PlayerBuff(def)
+        end
+        if present then
+          if type(expiration) == "number" and expiration > now and type(duration) == "number" and duration > 0 then
+            timers[def.key] = { start = expiration - duration, dur = duration }
+          elseif not timers[def.key] or now > timers[def.key].start + timers[def.key].dur then
+            local cp = def.scaled and GetCP() or 0
+            timers[def.key] = { start = now, dur = Duration(def, cp) }
+          end
+        else
+          timers[def.key] = nil
+        end
+      end
+    end
+    if unit.token == "target" and type(UnitIsDead) == "function" and UnitIsDead("target") then
+      FB.timers[name] = nil
+    end
+  end
 end
 
 ------------------------------------------------------------
@@ -143,6 +177,14 @@ local function Layout()
     FB.anchor:RegisterForDrag("LeftButton")
   end
   if db.locked then FB.anchor.tint:Hide() else FB.anchor.tint:Show() end
+end
+
+local function UpdateBarBackgrounds()
+  local db = RoguetimerDB
+  for _, bar in ipairs(FB.bars) do
+    bar.bg:SetVertexColor(0.08, 0.18, 0.25, db.backgroundAlpha)
+    if db.showBackground then bar.bg:Show() else bar.bg:Hide() end
+  end
 end
 
 local UpdateBars
@@ -181,12 +223,13 @@ local function BuildUI()
     local f = CreateFrame("Frame", nil, a)
     f.def = def
     f.bg = f:CreateTexture(nil, "BACKGROUND")
-    f.bg:SetTexture(BAR_TEX); f.bg:SetVertexColor(0, 0, 0, 0.55); f.bg:SetAllPoints(f)
+    f.bg:SetTexture(BAR_TEX); f.bg:SetVertexColor(0.08, 0.18, 0.25, db.backgroundAlpha); f.bg:SetAllPoints(f)
+    if db.showBackground then f.bg:Show() else f.bg:Hide() end
     f.ghost = f:CreateTexture(nil, "BORDER")
     f.ghost:SetTexture(BAR_TEX); f.ghost:SetVertexColor(c[1], c[2], c[3], 0.35)
     f.ghost:SetPoint("TOPLEFT", f, "TOPLEFT", 0, 0)
     f.fill = f:CreateTexture(nil, "ARTWORK")
-    f.fill:SetTexture(BAR_TEX); f.fill:SetVertexColor(c[1], c[2], c[3], 1)
+    f.fill:SetTexture(BAR_TEX); f.fill:SetVertexColor(c[1], c[2], c[3], 0.78)
     f.fill:SetPoint("TOPLEFT", f, "TOPLEFT", 0, 0)
     f.icon = f:CreateTexture(nil, "ARTWORK")
     f.icon:SetTexture("Interface\\Icons\\" .. def.tex)
@@ -233,7 +276,7 @@ local function CreateOptions()
   local panel = CreateFrame("Frame", "RoguetimerOptions", UIParent)
   FB.options = panel
   panel:SetWidth(310)
-  panel:SetHeight(410)
+  panel:SetHeight(455)
   panel:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
   panel:SetFrameStrata("DIALOG")
   panel:EnableMouse(true)
@@ -315,6 +358,35 @@ local function CreateOptions()
     row.label:SetPoint("LEFT", row, "LEFT", 32, 0)
   end
 
+  AddToggle("Show colored bar backgrounds", -225,
+    function() return RoguetimerDB.showBackground end,
+    function(value) RoguetimerDB.showBackground = value; UpdateBarBackgrounds() end,
+    "INV_Misc_StoneTablet_05")
+  local opacity = panel:CreateFontString(nil, "OVERLAY")
+  opacity:SetPoint("TOPLEFT", panel, "TOPLEFT", 24, -255)
+  SetOptionText(opacity, "Background opacity", 11, { 0.84, 0.88, 0.94 })
+  local opacityValue = panel:CreateFontString(nil, "OVERLAY")
+  opacityValue:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -64, -255)
+  SetOptionText(opacityValue, "", 11, { 1, 0.78, 0.32 })
+  local function RefreshOpacity()
+    opacityValue:SetText(string.format("%d%%", math.floor(RoguetimerDB.backgroundAlpha * 100 + 0.5)))
+  end
+  local opacityMinus = CreatePanelButton(panel, "-", 24, 22)
+  opacityMinus:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -42, -251)
+  opacityMinus:SetScript("OnClick", function()
+    RoguetimerDB.backgroundAlpha = math.max(0.05, RoguetimerDB.backgroundAlpha - 0.05)
+    RefreshOpacity()
+    UpdateBarBackgrounds()
+  end)
+  local opacityPlus = CreatePanelButton(panel, "+", 24, 22)
+  opacityPlus:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -14, -251)
+  opacityPlus:SetScript("OnClick", function()
+    RoguetimerDB.backgroundAlpha = math.min(0.8, RoguetimerDB.backgroundAlpha + 0.05)
+    RefreshOpacity()
+    UpdateBarBackgrounds()
+  end)
+  RefreshOpacity()
+
   local function AddSizeControl(label, y, key, minimum, maximum, step)
     local text = panel:CreateFontString(nil, "OVERLAY")
     text:SetPoint("TOPLEFT", panel, "TOPLEFT", 24, y)
@@ -336,11 +408,11 @@ local function CreateOptions()
     plus:SetScript("OnClick", function() Adjust(1) end)
   end
 
-  AddSizeControl("Bar width", -267, "width", 100, 420, 20)
-  AddSizeControl("Bar height", -294, "height", 12, 36, 2)
+  AddSizeControl("Bar width", -286, "width", 100, 420, 20)
+  AddSizeControl("Bar height", -313, "height", 12, 36, 2)
 
   local lock = CreatePanelButton(panel, "", 274, 26)
-  lock:SetPoint("TOPLEFT", panel, "TOPLEFT", 18, -323)
+  lock:SetPoint("TOPLEFT", panel, "TOPLEFT", 18, -342)
   lock.label:SetText("")
   lock.status = lock:CreateFontString(nil, "OVERLAY")
   lock.status:SetPoint("CENTER", lock, "CENTER", 0, 0)
@@ -356,14 +428,14 @@ local function CreateOptions()
   RefreshLock()
 
   local center = CreatePanelButton(panel, "CENTER BARS", 132, 27)
-  center:SetPoint("TOPLEFT", panel, "TOPLEFT", 18, -357)
+  center:SetPoint("TOPLEFT", panel, "TOPLEFT", 18, -376)
   center:SetScript("OnClick", function()
     RoguetimerDB.x, RoguetimerDB.y = nil, nil
     FB.anchor:ClearAllPoints()
     FB.anchor:SetPoint("CENTER", UIParent, "CENTER", 0, -100)
   end)
   local close = CreatePanelButton(panel, "CLOSE", 132, 27)
-  close:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -18, -357)
+  close:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -18, -376)
   close:SetScript("OnClick", function() panel:Hide() end)
   panel:Hide()
 
@@ -390,32 +462,47 @@ local function CreateOptions()
       RoguetimerDB.minimapAngle = angle
       local radians = angle * math.pi / 180
       local minimapWidth = type(Minimap.GetWidth) == "function" and Minimap:GetWidth() or 140
-      local radius = (minimapWidth / 2) + 5
+      local buttonWidth = type(button.GetWidth) == "function" and button:GetWidth() or 32
+      local radius = math.max(0, minimapWidth / 2 - buttonWidth / 2 - 4)
       button:ClearAllPoints()
       button:SetPoint("CENTER", Minimap, "CENTER",
         math.cos(radians) * radius, math.sin(radians) * radius)
     end
-    button:SetScript("OnDragStart", function(self) self:StartMoving() end)
-    button:SetScript("OnDragStop", function(self)
-      self:StopMovingOrSizing()
-      if type(GetCursorPosition) == "function"
-        and type(Minimap.GetCenter) == "function"
-        and type(Minimap.GetEffectiveScale) == "function" then
-        local x, y = GetCursorPosition()
-        local mx, my = Minimap:GetCenter()
-        local scale = Minimap:GetEffectiveScale()
-        local dx, dy = x / scale - mx, y / scale - my
-        local angle
-        if type(math.atan2) == "function" then
-          angle = math.atan2(dy, dx) * 180 / math.pi
-        else
-          angle = math.atan(dy / (dx == 0 and 0.0001 or dx)) * 180 / math.pi
-          if dx < 0 then angle = angle + 180 end
-        end
-        PositionMinimapButton(angle)
-      else
-        PositionMinimapButton()
+    local function UpdateMinimapButtonPosition()
+      if type(GetCursorPosition) ~= "function"
+        or type(Minimap.GetCenter) ~= "function"
+        or type(Minimap.GetEffectiveScale) ~= "function" then
+        return
       end
+
+      local x, y = GetCursorPosition()
+      local mx, my = Minimap:GetCenter()
+      local scale = Minimap:GetEffectiveScale()
+      local dx, dy = x / scale - mx, y / scale - my
+      local angle
+      if type(math.atan2) == "function" then
+        angle = math.atan2(dy, dx) * 180 / math.pi
+      elseif dx > 0 then
+        angle = math.atan(dy / dx) * 180 / math.pi
+      elseif dx < 0 then
+        angle = math.atan(dy / dx) * 180 / math.pi + 180
+      elseif dy > 0 then
+        angle = 90
+      else
+        angle = -90
+      end
+      PositionMinimapButton(angle)
+    end
+    local dragging = false
+    button:SetScript("OnDragStart", function()
+      dragging = true
+    end)
+    button:SetScript("OnUpdate", function()
+      if dragging then UpdateMinimapButtonPosition() end
+    end)
+    button:SetScript("OnDragStop", function()
+      dragging = false
+      UpdateMinimapButtonPosition()
     end)
     PositionMinimapButton()
     button:SetScript("OnClick", function()
@@ -453,13 +540,22 @@ UpdateBars = function()
     local enabled = db.bars[def.key] ~= false
 
     if def.key == "SND" then
-      remaining = SnDLeft()
+      local playerName = type(UnitName) == "function" and UnitName("player") or "player"
+      local present, _, expiration = PlayerBuff(def)
+      if present and type(expiration) == "number" then
+        remaining = math.max(0, expiration - now)
+      elseif FB.timers[playerName] and FB.timers[playerName][def.key] then
+        local timer = FB.timers[playerName][def.key]
+        remaining = math.max(0, timer.start + timer.dur - now)
+      end
     elseif tname and FB.timers[tname] and FB.timers[tname][def.key] then
       local tm = FB.timers[tname][def.key]
       remaining = tm.start + tm.dur - now
       if remaining < 0 then remaining = 0 end
     end
-    if def.scaled and hasTarget and cp > 0 then ghost = Duration(def, cp) end
+    if hasTarget and (not def.finisher or cp > 0) then
+      ghost = Duration(def, cp)
+    end
 
     if enabled and (remaining > 0 or ghost > 0 or db.showInactive or not db.locked) then
       f:Show()
@@ -467,7 +563,8 @@ UpdateBars = function()
       local fw = math.min(remaining, MAXTIME) / MAXTIME * W
       if gw >= 1 then f.ghost:SetWidth(gw); f.ghost:Show() else f.ghost:Hide() end
       if fw >= 1 then f.fill:SetWidth(fw); f.fill:Show() else f.fill:Hide() end
-      if remaining > 0 then f.text:SetText(string.format("%.2f", remaining)) else f.text:SetText("") end
+      local displayed = remaining > 0 and remaining or ghost
+      if displayed > 0 then f.text:SetText(string.format("%.1f", displayed)) else f.text:SetText("") end
     else
       f:Hide()
     end
@@ -513,6 +610,9 @@ ev:SetScript("OnEvent", function(self, e, a1)
     RoguetimerDB.spacing = math.max(0, math.min(20, RoguetimerDB.spacing))
     if type(RoguetimerDB.locked) ~= "boolean" then RoguetimerDB.locked = DEFAULTS.locked end
     if type(RoguetimerDB.showInactive) ~= "boolean" then RoguetimerDB.showInactive = DEFAULTS.showInactive end
+    if type(RoguetimerDB.showBackground) ~= "boolean" then RoguetimerDB.showBackground = DEFAULTS.showBackground end
+    if type(RoguetimerDB.backgroundAlpha) ~= "number" then RoguetimerDB.backgroundAlpha = DEFAULTS.backgroundAlpha end
+    RoguetimerDB.backgroundAlpha = math.max(0.05, math.min(0.8, RoguetimerDB.backgroundAlpha))
     if type(RoguetimerDB.bars) ~= "table" then RoguetimerDB.bars = {} end
     for _, def in ipairs(DEFS) do
       if RoguetimerDB.bars[def.key] == nil then RoguetimerDB.bars[def.key] = true end
@@ -521,6 +621,7 @@ ev:SetScript("OnEvent", function(self, e, a1)
     if class ~= "ROGUE" then return end
     active = true
     BuildUI()
+    UpdateBarBackgrounds()
     CreateOptions()
     ScanTalents()
   elseif not active then
