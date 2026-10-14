@@ -389,7 +389,8 @@ local function CreateOptions()
       angle = angle or RoguetimerDB.minimapAngle or 220
       RoguetimerDB.minimapAngle = angle
       local radians = angle * math.pi / 180
-      local radius = (Minimap:GetWidth() / 2) + 5
+      local minimapWidth = type(Minimap.GetWidth) == "function" and Minimap:GetWidth() or 140
+      local radius = (minimapWidth / 2) + 5
       button:ClearAllPoints()
       button:SetPoint("CENTER", Minimap, "CENTER",
         math.cos(radians) * radius, math.sin(radians) * radius)
