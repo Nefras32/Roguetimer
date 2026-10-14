@@ -1,0 +1,8 @@
+## Interface: 16001
+## Title: ForeverBars
+## Notes: Balken fuer Slice and Dice, Rupture, Garrote und Expose Armor (Rogue)
+## Author: -
+## Version: 0.1
+## SavedVariables: ForeverBarsDB
+
+ForeverBars.lua
