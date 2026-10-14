@@ -39,6 +39,8 @@ local FB = {
   pendingCP = 0,
   pendingTarget = nil,
   lastTargetKey = nil,
+  targetGeneration = 0,
+  inBattleground = false,
   debugSnd = false,
 }
 for _, d in ipairs(DEFS) do FB.defByKey[d.key] = d end
@@ -55,34 +57,65 @@ end
 ------------------------------------------------------------
 -- Helpers
 ------------------------------------------------------------
+local function IsSecretValue(value)
+  return type(issecretvalue) == "function" and issecretvalue(value)
+end
+
 local function GetCP()
   if type(UnitPower) == "function" then
     local comboPointPower = Enum and Enum.PowerType and Enum.PowerType.ComboPoints or 4
-    return UnitPower("player", comboPointPower) or 0
+    local value = UnitPower("player", comboPointPower)
+    if not IsSecretValue(value) and type(value) == "number" then return value end
+    return 0
   end
   if type(GetComboPoints) == "function" then
-    return GetComboPoints("player", "target") or 0
+    local value = GetComboPoints("player", "target")
+    if not IsSecretValue(value) and type(value) == "number" then return value end
   end
   return 0
 end
 
+local function SafeUnitExists(unit)
+  if type(UnitExists) ~= "function" then return false end
+  local exists = UnitExists(unit)
+  if IsSecretValue(exists) then return false end
+  return exists == true
+end
+
 local function UnitTimerKey(unit)
+  if unit == "player" then return "player" end
   if type(UnitGUID) == "function" then
     local guid = UnitGUID(unit)
-    if guid then return guid end
+    if not IsSecretValue(guid) and type(guid) == "string" and guid ~= "" then
+      return guid
+    end
   end
-  if type(UnitName) == "function" then
-    return UnitName(unit) or unit
+  return "target:" .. FB.targetGeneration
+end
+
+local function IsInBattleground()
+  if type(_G.IsInBattleground) == "function" then
+    local inBattleground = _G.IsInBattleground()
+    if not IsSecretValue(inBattleground) then
+      return inBattleground == true
+    end
   end
-  return unit
+  if type(IsInInstance) == "function" then
+    local inInstance, instanceType = IsInInstance()
+    if not IsSecretValue(inInstance) and inInstance == true
+      and not IsSecretValue(instanceType) then
+      return instanceType == "pvp"
+    end
+  end
+  return false
 end
 
 local function TrackComboPoints()
   local targetKey
-  if type(UnitExists) == "function" and UnitExists("target") then
+  if SafeUnitExists("target") then
     targetKey = UnitTimerKey("target")
-    FB.lastTargetKey = targetKey
   end
+  FB.lastTargetKey = targetKey
   if targetKey ~= FB.pendingTarget then
     FB.pendingTarget = targetKey
     FB.pendingCP = 0
@@ -658,15 +691,25 @@ end
 
 UpdateBars = function()
   local db = RoguetimerDB
+  if FB.inBattleground then
+    FB.anchor:Hide()
+    return
+  end
   local now = GetTime()
   local W = db.width
   local cp = GetCP()
-  local targetExists = type(UnitExists) == "function" and UnitExists("target")
-  local targetIsDead = targetExists and (
-    (type(UnitIsDeadOrGhost) == "function" and UnitIsDeadOrGhost("target"))
-    or (type(UnitIsDead) == "function" and UnitIsDead("target")))
+  local targetExists = SafeUnitExists("target")
+  local targetIsDead = false
+  if targetExists and type(UnitIsDeadOrGhost) == "function" then
+    local isDead = UnitIsDeadOrGhost("target")
+    if not IsSecretValue(isDead) and isDead == true then targetIsDead = true end
+  end
+  if targetExists and not targetIsDead and type(UnitIsDead) == "function" then
+    local isDead = UnitIsDead("target")
+    if not IsSecretValue(isDead) and isDead == true then targetIsDead = true end
+  end
   local targetAlive = targetExists and not targetIsDead
-  local targetKey = targetExists and UnitTimerKey("target") or FB.lastTargetKey
+  local targetKey = targetExists and UnitTimerKey("target") or nil
   local activeRuptures = {}
   local currentTargetRupture
 
@@ -791,10 +834,29 @@ local function RegisterEvent(name)
 end
 RegisterEvent("ADDON_LOADED")
 RegisterEvent("PLAYER_ENTERING_WORLD")
+RegisterEvent("PLAYER_TARGET_CHANGED")
+RegisterEvent("ZONE_CHANGED_NEW_AREA")
 RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 RegisterEvent("PLAYER_TALENT_UPDATE")
 
 local active = false
+
+local function RefreshInstanceState()
+  local inBattleground = IsInBattleground()
+  if inBattleground == FB.inBattleground then return end
+  FB.inBattleground = inBattleground
+  if inBattleground then
+    FB.timers = {}
+    FB.pendingCP = 0
+    FB.pendingTarget = nil
+    FB.lastTargetKey = nil
+    FB.anchor:Hide()
+  else
+    FB.anchor:Show()
+    TrackComboPoints()
+    UpdateBars()
+  end
+end
 
 ev:SetScript("OnEvent", function(self, e, a1, ...)
   e = e or event
@@ -843,19 +905,32 @@ ev:SetScript("OnEvent", function(self, e, a1, ...)
     BuildUI()
     CreateOptions()
     ScanTalents()
+    RefreshInstanceState()
   elseif not active then
     return
   elseif e == "PLAYER_ENTERING_WORLD" then
     ScanTalents()
+    RefreshInstanceState()
+  elseif e == "ZONE_CHANGED_NEW_AREA" then
+    RefreshInstanceState()
+  elseif e == "PLAYER_TARGET_CHANGED" then
+    if FB.inBattleground then return end
+    FB.targetGeneration = FB.targetGeneration + 1
+    FB.pendingCP = 0
+    FB.pendingTarget = nil
+    TrackComboPoints()
+    UpdateBars()
   elseif e == "PLAYER_TALENT_UPDATE" then
     ScanTalents()
   elseif e == "UNIT_SPELLCAST_SUCCEEDED" then
+    if FB.inBattleground then return end
     TrackFinisherCast(a1, ...)
   end
 end)
 
 ev:SetScript("OnUpdate", function(self, elapsed)
   if not active then return end
+  if FB.inBattleground then return end
   TrackComboPoints()
   UpdateBars()
 end)
