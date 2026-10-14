@@ -1,0 +1,33 @@
+name: Publish to CurseForge
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate CurseForge configuration
+        env:
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+          CF_PROJECT_ID: ${{ vars.CURSEFORGE_PROJECT_ID }}
+        run: |
+          test -n "$CF_API_KEY" || { echo "::error::Set the CF_API_KEY repository secret."; exit 1; }
+          test -n "$CF_PROJECT_ID" || { echo "::error::Set the CURSEFORGE_PROJECT_ID repository variable."; exit 1; }
+
+      - name: Package and publish add-on
+        uses: BigWigsMods/packager@v2
+        env:
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+        with:
+          args: -t Roguetimer/Roguetimer -p ${{ vars.CURSEFORGE_PROJECT_ID }}
