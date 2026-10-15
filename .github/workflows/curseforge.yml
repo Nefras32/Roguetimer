@@ -32,4 +32,4 @@ jobs:
         env:
           CF_API_KEY: ${{ secrets.CF_API_KEY }}
         with:
-          args: -t Roguetimer/Roguetimer -p ${{ vars.CURSEFORGE_PROJECT_ID }}
+          args: -t Roguetimer -p ${{ vars.CURSEFORGE_PROJECT_ID }}

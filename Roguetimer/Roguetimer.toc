@@ -1,0 +1,8 @@
+## Interface: 16001
+## Title: Roguetimer
+## Notes: Tracks Rogue finishers with options for timers, bar size, spacing, visibility, and position. Open options via the minimap button or /roguetimer options.
+## Author: -
+## Version: 0.2.1
+## SavedVariables: RoguetimerDB, ForeverBarsDB
+
+Roguetimer.lua

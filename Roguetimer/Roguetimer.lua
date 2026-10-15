@@ -1,4 +1,4 @@
--- Roguetimer 0.1
+-- Roguetimer 0.2
 -- Rogue timers for the Forever WoW 1.60 client (Interface 16001).
 -- Starts finisher timers from successful spellcast events.
 
