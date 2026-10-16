@@ -4,13 +4,6 @@
 
 local MAXTIME = 30
 local BAR_TEX = "Interface\\Buttons\\WHITE8X8"
-local RUPTURE_SHADES = {
-  { 1.00, 0.08, 0.08, 0.58 },
-  { 0.78, 0.02, 0.16, 0.72 },
-  { 0.92, 0.22, 0.04, 0.58 },
-  { 0.58, 0.04, 0.06, 0.82 },
-  { 1.00, 0.32, 0.28, 0.48 },
-}
 
 -- Identify spells by icon path (language-independent).
 -- finisher consumes combo points; scaled duration depends on combo points.
@@ -27,6 +20,7 @@ local DEFAULTS = {
   spacing = 4,
   locked = true,
   showInactive = true,
+  colors = {},
 }
 
 local FB = {
@@ -41,9 +35,115 @@ local FB = {
   lastTargetKey = nil,
   targetGeneration = 0,
   inBattleground = false,
-  debugSnd = false,
+  lastExposeKey = nil,
+  debug = false,
+  lastErrors = {},
 }
-for _, d in ipairs(DEFS) do FB.defByKey[d.key] = d end
+for _, d in ipairs(DEFS) do
+  FB.defByKey[d.key] = d
+  DEFAULTS.colors[d.key] = { d.color[1], d.color[2], d.color[3] }
+end
+
+local function GetBarColor(key)
+  local color = RoguetimerDB.colors and RoguetimerDB.colors[key]
+  local fallback = DEFAULTS.colors[key]
+  if type(color) ~= "table"
+    or type(color[1]) ~= "number" or color[1] < 0 or color[1] > 1
+    or type(color[2]) ~= "number" or color[2] < 0 or color[2] > 1
+    or type(color[3]) ~= "number" or color[3] < 0 or color[3] > 1 then
+    return fallback
+  end
+  return color
+end
+
+local function ApplyBarColor(bar)
+  local color = GetBarColor(bar.def.key)
+  bar.ghost:SetVertexColor(color[1], color[2], color[3], 0.35)
+  bar.fill:SetVertexColor(color[1], color[2], color[3], 0.78)
+  if bar.ruptureCurrentFill then
+    bar.ruptureCurrentFill:SetVertexColor(color[1], color[2], color[3], 1)
+  end
+  for _, layer in ipairs(bar.ruptureLayers or {}) do
+    layer:SetVertexColor(color[1], color[2], color[3], layer.alpha or 0.55)
+  end
+  for _, layer in ipairs(bar.garroteLayers or {}) do
+    layer:SetVertexColor(color[1], color[2], color[3], layer.alpha or 0.55)
+  end
+end
+
+local function DebugMessage(message)
+  if FB.debug and DEFAULT_CHAT_FRAME and type(DEFAULT_CHAT_FRAME.AddMessage) == "function" then
+    DEFAULT_CHAT_FRAME:AddMessage("|cffffcc00Roguetimer debug:|r " .. tostring(message))
+  end
+end
+
+local function ReportApiError(api, err)
+  local key = "api:" .. api
+  if FB.lastErrors[key] then return end
+  FB.lastErrors[key] = tostring(err)
+  if DEFAULT_CHAT_FRAME and type(DEFAULT_CHAT_FRAME.AddMessage) == "function" then
+    DEFAULT_CHAT_FRAME:AddMessage("Roguetimer: " .. api .. " failed: " .. tostring(err))
+  end
+end
+
+local function RunWithDiagnostics(context, callback, ...)
+  if not FB.debug then return callback(...) end
+  local args = { ... }
+  local unpackArgs = unpack or table.unpack
+  local ok, result = xpcall(function()
+    return callback(unpackArgs(args))
+  end, function(err)
+    local key = "script:" .. context .. ":" .. tostring(err)
+    if not FB.lastErrors[key] then
+      FB.lastErrors[key] = true
+      local trace = type(debugstack) == "function" and debugstack(2, 8, 8) or tostring(err)
+      if DEFAULT_CHAT_FRAME and type(DEFAULT_CHAT_FRAME.AddMessage) == "function" then
+        DEFAULT_CHAT_FRAME:AddMessage("Roguetimer error [" .. context .. "]: "
+          .. tostring(err) .. "\n" .. tostring(trace))
+      end
+    end
+    return err
+  end)
+  if not ok then error(result, 0) end
+  return result
+end
+
+local function DebugState()
+  local timerCount = 0
+  local errorCount = 0
+  for _, targetTimers in pairs(FB.timers) do
+    for _ in pairs(targetTimers) do timerCount = timerCount + 1 end
+  end
+  for _ in pairs(FB.lastErrors) do errorCount = errorCount + 1 end
+  local target = "none"
+  if type(UnitExists) == "function" then
+    local existsOK, exists = pcall(UnitExists, "target")
+    local existsIsSecret = type(issecretvalue) == "function" and issecretvalue(exists)
+    if existsOK and not existsIsSecret and exists == true then
+      if type(UnitName) == "function" then
+        local nameOK, name = pcall(UnitName, "target")
+        local nameIsSecret = type(issecretvalue) == "function" and issecretvalue(name)
+        if nameOK and not nameIsSecret and type(name) == "string" then target = name end
+      end
+      if target == "none" then target = "unknown" end
+    end
+  end
+  local instanceType = "unknown"
+  if type(IsInInstance) == "function" then
+    local ok, inInstance, kind = pcall(IsInInstance)
+    local instanceIsSecret = type(issecretvalue) == "function" and issecretvalue(inInstance)
+    local kindIsSecret = type(issecretvalue) == "function" and issecretvalue(kind)
+    if ok and not instanceIsSecret then
+      instanceType = inInstance == true and not kindIsSecret and (kind or "instance") or "world"
+    end
+  end
+  if DEFAULT_CHAT_FRAME and type(DEFAULT_CHAT_FRAME.AddMessage) == "function" then
+    DEFAULT_CHAT_FRAME:AddMessage(string.format(
+      "Roguetimer: target=%s key=%s timers=%d instance=%s battleground=%s reportedErrors=%d",
+      tostring(target), tostring(FB.lastTargetKey), timerCount,
+      tostring(instanceType), tostring(FB.inBattleground), errorCount))
+  end
+end
 
 -- Finisher durations are calculated from combo points captured before the cast.
 local function Duration(def, cp)
@@ -64,20 +164,31 @@ end
 local function GetCP()
   if type(UnitPower) == "function" then
     local comboPointPower = Enum and Enum.PowerType and Enum.PowerType.ComboPoints or 4
-    local value = UnitPower("player", comboPointPower)
-    if not IsSecretValue(value) and type(value) == "number" then return value end
-    return 0
+    local ok, value = pcall(UnitPower, "player", comboPointPower)
+    if ok then
+      if not IsSecretValue(value) and type(value) == "number" then return value end
+      return 0
+    end
+    ReportApiError("UnitPower", value)
   end
   if type(GetComboPoints) == "function" then
-    local value = GetComboPoints("player", "target")
-    if not IsSecretValue(value) and type(value) == "number" then return value end
+    local ok, value = pcall(GetComboPoints, "player", "target")
+    if ok then
+      if not IsSecretValue(value) and type(value) == "number" then return value end
+    else
+      ReportApiError("GetComboPoints", value)
+    end
   end
   return 0
 end
 
 local function SafeUnitExists(unit)
   if type(UnitExists) ~= "function" then return false end
-  local exists = UnitExists(unit)
+  local ok, exists = pcall(UnitExists, unit)
+  if not ok then
+    ReportApiError("UnitExists", exists)
+    return false
+  end
   if IsSecretValue(exists) then return false end
   return exists == true
 end
@@ -85,9 +196,17 @@ end
 local function UnitTimerKey(unit)
   if unit == "player" then return "player" end
   if type(UnitGUID) == "function" then
-    local guid = UnitGUID(unit)
-    if not IsSecretValue(guid) and type(guid) == "string" and guid ~= "" then
+    local ok, guid = pcall(UnitGUID, unit)
+    if not ok then
+      ReportApiError("UnitGUID", guid)
+    elseif not IsSecretValue(guid) and type(guid) == "string" and guid ~= "" then
       return guid
+    end
+  end
+  if type(UnitName) == "function" then
+    local ok, name = pcall(UnitName, unit)
+    if ok and not IsSecretValue(name) and type(name) == "string" and name ~= "" then
+      return "name:" .. name
     end
   end
   return "target:" .. FB.targetGeneration
@@ -95,14 +214,18 @@ end
 
 local function IsInBattleground()
   if type(_G.IsInBattleground) == "function" then
-    local inBattleground = _G.IsInBattleground()
-    if not IsSecretValue(inBattleground) then
+    local ok, inBattleground = pcall(_G.IsInBattleground)
+    if not ok then
+      ReportApiError("IsInBattleground", inBattleground)
+    elseif not IsSecretValue(inBattleground) then
       return inBattleground == true
     end
   end
   if type(IsInInstance) == "function" then
-    local inInstance, instanceType = IsInInstance()
-    if not IsSecretValue(inInstance) and inInstance == true
+    local ok, inInstance, instanceType = pcall(IsInInstance)
+    if not ok then
+      ReportApiError("IsInInstance", inInstance)
+    elseif not IsSecretValue(inInstance) and inInstance == true
       and not IsSecretValue(instanceType) then
       return instanceType == "pvp"
     end
@@ -125,7 +248,7 @@ local function TrackComboPoints()
 end
 
 local function DebugInitialization()
-  if not FB.debugSnd or not DEFAULT_CHAT_FRAME
+  if not FB.debug or not DEFAULT_CHAT_FRAME
     or type(DEFAULT_CHAT_FRAME.AddMessage) ~= "function" then
     return
   end
@@ -138,7 +261,7 @@ local function DebugInitialization()
     table.insert(states, tostring(bar.def.key) .. "=" .. tostring(isShown))
   end
   DEFAULT_CHAT_FRAME:AddMessage(string.format(
-    "Roguetimer init: initialized=true anchorShown=%s barsCreated=%d barsShown=%d sndTalentPoints=%d {%s}",
+    "Roguetimer debug: initialized=true anchorShown=%s barsCreated=%d barsShown=%d sndTalentPoints=%d {%s}",
     tostring(FB.anchor and FB.anchor:IsShown() or false),
     count, shown, FB.sndTalentPoints, table.concat(states, ",")))
 end
@@ -236,8 +359,11 @@ local function TrackFinisherCast(unit, castGUID, spellID)
     dur = duration,
     source = "UNIT_SPELLCAST_SUCCEEDED",
   }
+  if def.key == "EXP" then FB.lastExposeKey = key end
+  DebugMessage(string.format("%s applied to %s for %.1fs (%d combo points)",
+    def.key, tostring(key), duration, cp))
   FB.pendingCP = 0
-  if FB.debugSnd and DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
+  if FB.debug and DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
     local expiration = now + duration
     DEFAULT_CHAT_FRAME:AddMessage(string.format(
       "Roguetimer %s: castConfirmed=true comboPoints=%d duration=%.1f expiration=%.1f remaining=%.1f",
@@ -252,7 +378,7 @@ local function Layout()
   local db = RoguetimerDB
   local W, H, S = db.width, db.height, db.spacing
   FB.anchor:SetWidth(W + H + 3)
-  FB.anchor:SetHeight(4 * (H + S))
+  FB.anchor:SetHeight(#DEFS * (H + S))
   for i, f in ipairs(FB.bars) do
     f:SetWidth(W); f:SetHeight(H)
     f:ClearAllPoints()
@@ -312,7 +438,6 @@ local function BuildUI()
   a:SetScript("OnDragStop", SaveAnchorPosition)
 
   for i, def in ipairs(DEFS) do
-    local c = def.color
     local f = CreateFrame("Frame", nil, a)
     f.def = def
     if not f.bg then
@@ -326,19 +451,26 @@ local function BuildUI()
     end)
     f:SetScript("OnDragStop", SaveAnchorPosition)
     f.ghost = f:CreateTexture(nil, "BORDER")
-    f.ghost:SetTexture(BAR_TEX); f.ghost:SetVertexColor(c[1], c[2], c[3], 0.35)
+    f.ghost:SetTexture(BAR_TEX)
     f.ghost:SetPoint("TOPLEFT", f, "TOPLEFT", 0, 0)
     f.fill = f:CreateTexture(nil, "ARTWORK")
-    f.fill:SetTexture(BAR_TEX); f.fill:SetVertexColor(c[1], c[2], c[3], 0.78)
+    f.fill:SetTexture(BAR_TEX)
     f.fill:SetPoint("TOPLEFT", f, "TOPLEFT", 0, 0)
     if def.key == "RUP" then
       f.ruptureLayers = {}
       f.ruptureCurrentFill = f:CreateTexture(nil, "ARTWORK")
       f.ruptureCurrentFill:SetTexture(BAR_TEX)
-      f.ruptureCurrentFill:SetVertexColor(1, 0.12, 0.12, 1)
       f.ruptureCurrentFill:SetPoint("TOPLEFT", f, "TOPLEFT", 0, 0)
       f.ruptureCurrentFill:SetHeight(db.height)
       f.ruptureCurrentFill:Hide()
+    elseif def.key == "GAR" then
+      f.garroteLayers = {}
+    elseif def.key == "EXP" then
+      f.inactiveOverlay = f:CreateTexture(nil, "ARTWORK")
+      f.inactiveOverlay:SetTexture(BAR_TEX)
+      f.inactiveOverlay:SetVertexColor(0.55, 0.55, 0.55, 0.45)
+      f.inactiveOverlay:SetAllPoints(f)
+      f.inactiveOverlay:Hide()
     end
     f.icon = f:CreateTexture(nil, "ARTWORK")
     f.icon:SetTexture("Interface\\Icons\\" .. def.tex)
@@ -350,55 +482,46 @@ local function BuildUI()
     f.text:SetPoint("RIGHT", f, "RIGHT", -4, 0)
     f:Show()
     FB.bars[i] = f
+    ApplyBarColor(f)
   end
   Layout()
   a:Show()
 end
 
 local function SetOptionText(region, text, size, color)
-  region:SetFont(FB.optionFont or STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF", size or 12, "OUTLINE")
+  region:SetFont(STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF", size or 12, "")
   region:SetText(text)
   if color then region:SetTextColor(color[1], color[2], color[3]) end
 end
 
 local function CreatePanelButton(parent, text, width, height)
-  local button = CreateFrame("Button", nil, parent)
+  local button = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
   button:SetWidth(width)
   button:SetHeight(height)
-  button.fill = button:CreateTexture(nil, "BACKGROUND")
-  button.fill:SetTexture(BAR_TEX)
-  button.fill:SetVertexColor(0.12, 0.16, 0.22, 0.95)
-  button.fill:SetAllPoints(button)
-  button.label = button:CreateFontString(nil, "OVERLAY")
-  button.label:SetPoint("CENTER", button, "CENTER", 0, 0)
-  SetOptionText(button.label, text, 12, { 0.95, 0.82, 0.48 })
-  button:SetScript("OnEnter", function()
-    button.fill:SetVertexColor(0.27, 0.20, 0.10, 1)
-    button.label:SetTextColor(1, 0.92, 0.68)
-  end)
-  button:SetScript("OnLeave", function()
-    button.fill:SetVertexColor(0.12, 0.16, 0.22, 0.95)
-    button.label:SetTextColor(0.95, 0.82, 0.48)
-  end)
+  button:SetText(text)
+  button.label = button:GetFontString()
+  if button.label then
+    button.label:SetFont(STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF", 12, "")
+  end
   return button
 end
 
 local function CreateOptions()
   local panel = CreateFrame("Frame", "RoguetimerOptions", UIParent)
   FB.options = panel
-  FB.optionFont = STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF"
-  panel:SetWidth(350)
-  panel:SetHeight(520)
-  panel:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+  panel:SetWidth(440)
+  panel:SetHeight(410)
   panel:SetFrameStrata("DIALOG")
+  panel:SetClampedToScreen(true)
   panel:EnableMouse(true)
   panel:SetMovable(true)
   panel:RegisterForDrag("LeftButton")
   panel:SetScript("OnDragStart", function(self) self:StartMoving() end)
   panel:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
+  panel:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
   panel.background = panel:CreateTexture(nil, "BACKGROUND")
   panel.background:SetTexture(BAR_TEX)
-  panel.background:SetVertexColor(0.025, 0.035, 0.055, 0.98)
+  panel.background:SetVertexColor(0.04, 0.05, 0.07, 0.98)
   panel.background:SetAllPoints(panel)
   if type(panel.SetBackdrop) == "function" then
     panel:SetBackdrop({
@@ -406,77 +529,166 @@ local function CreateOptions()
       edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
       tile = true,
       tileSize = 16,
-      edgeSize = 14,
+      edgeSize = 16,
       insets = { left = 4, right = 4, top = 4, bottom = 4 },
     })
-    panel:SetBackdropColor(0.025, 0.035, 0.055, 0.97)
-    panel:SetBackdropBorderColor(0.72, 0.48, 0.16, 1)
+    panel:SetBackdropColor(0.04, 0.05, 0.07, 0.98)
+    panel:SetBackdropBorderColor(0.45, 0.48, 0.52, 1)
   end
-
+  local titleBar = CreateFrame("Frame", nil, panel)
+  titleBar:SetPoint("TOPLEFT", panel, "TOPLEFT", 8, -8)
+  titleBar:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -8, -8)
+  titleBar:SetHeight(44)
+  titleBar:EnableMouse(true)
+  titleBar:RegisterForDrag("LeftButton")
+  titleBar:SetScript("OnDragStart", function() panel:StartMoving() end)
+  titleBar:SetScript("OnDragStop", function() panel:StopMovingOrSizing() end)
   local title = panel:CreateFontString(nil, "OVERLAY")
-  title:SetPoint("TOPLEFT", panel, "TOPLEFT", 20, -17)
-  SetOptionText(title, "ROGUETIMER", 19, { 1, 0.78, 0.32 })
-  local subtitle = panel:CreateFontString(nil, "OVERLAY")
-  subtitle:SetPoint("TOPLEFT", panel, "TOPLEFT", 21, -44)
-  SetOptionText(subtitle, "COMBAT TIMERS  /  DISPLAY SETTINGS", 9, { 0.62, 0.72, 0.82 })
-
-  local headerRule = panel:CreateTexture(nil, "ARTWORK")
-  headerRule:SetTexture(BAR_TEX)
-  headerRule:SetVertexColor(0.72, 0.48, 0.16, 0.9)
-  headerRule:SetHeight(1)
-  headerRule:SetPoint("TOPLEFT", panel, "TOPLEFT", 20, -62)
-  headerRule:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -20, -62)
-
-  local close = CreatePanelButton(panel, "X", 25, 25)
-  close:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -15, -14)
-  close.label:SetFont(STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF", 14, "OUTLINE")
-  close.label:SetTextColor(0.88, 0.72, 0.68)
-  close:SetScript("OnEnter", function()
-    close.fill:SetVertexColor(0.48, 0.12, 0.12, 1)
-    close.label:SetTextColor(1, 0.9, 0.88)
-  end)
-  close:SetScript("OnLeave", function()
-    close.fill:SetVertexColor(0.12, 0.16, 0.22, 0.95)
-    close.label:SetTextColor(0.88, 0.72, 0.68)
-  end)
+  title:SetPoint("LEFT", titleBar, "LEFT", 12, 0)
+  SetOptionText(title, "Roguetimer", 14)
+  local description = panel:CreateFontString(nil, "OVERLAY")
+  description:SetPoint("LEFT", title, "RIGHT", 12, 0)
+  SetOptionText(description, "Timer and display settings", 12)
+  local close = CreateFrame("Button", nil, panel, "UIPanelCloseButton")
+  close:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -5, -5)
   close:SetScript("OnClick", function() panel:Hide() end)
 
   local function AddSectionHeading(text, y)
     local heading = panel:CreateFontString(nil, "OVERLAY")
-    heading:SetPoint("TOPLEFT", panel, "TOPLEFT", 21, y)
-    SetOptionText(heading, text, 10, { 1, 0.78, 0.32 })
-    local rule = panel:CreateTexture(nil, "ARTWORK")
-    rule:SetTexture(BAR_TEX)
-    rule:SetVertexColor(0.28, 0.34, 0.42, 0.65)
-    rule:SetHeight(1)
-    rule:SetPoint("LEFT", heading, "RIGHT", 10, -3)
-    rule:SetPoint("RIGHT", panel, "RIGHT", -20, -3)
+    heading:SetPoint("TOPLEFT", panel, "TOPLEFT", 16, y)
+    SetOptionText(heading, text, 12)
   end
 
-  AddSectionHeading("TRACKED TIMERS", -76)
+  AddSectionHeading("TRACKED TIMERS / BAR COLORS", -56)
 
-  local function AddToggle(label, y, getValue, setValue, icon)
-    local row = CreatePanelButton(panel, "", 314, 27)
-    row:SetPoint("TOPLEFT", panel, "TOPLEFT", 18, y)
-    row.icon = row:CreateTexture(nil, "ARTWORK")
-    row.icon:SetWidth(20)
-    row.icon:SetHeight(20)
-    row.icon:SetPoint("LEFT", row, "LEFT", 6, 0)
-    row.icon:SetTexture("Interface\\Icons\\" .. (icon or "Ability_Warrior_Riposte"))
-    row.label = row:CreateFontString(nil, "OVERLAY")
-    row.label:SetPoint("LEFT", row, "LEFT", 32, 0)
-    SetOptionText(row.label, label, 11, { 0.91, 0.93, 0.97 })
-    row.state = row:CreateFontString(nil, "OVERLAY")
-    row.state:SetPoint("RIGHT", row, "RIGHT", -8, 0)
-    local function Refresh()
-      if getValue() then
-        SetOptionText(row.state, "ON", 10, { 0.95, 0.82, 0.48 })
-      else
-        SetOptionText(row.state, "OFF", 10, { 0.72, 0.48, 0.45 })
-      end
+  local function AddTrackedBarRow(def, index, label)
+    local toggleIndex = (FB.toggleIndex or 0) + 1
+    FB.toggleIndex = toggleIndex
+    local rowName = "RoguetimerOptionToggle" .. toggleIndex
+    local row = CreateFrame("CheckButton", rowName, panel, "InterfaceOptionsCheckButtonTemplate")
+    local y = -72 - (index - 1) * 28
+    row:SetSize(24, 24)
+    row:SetPoint("TOPLEFT", panel, "TOPLEFT", 12, y)
+    row:SetChecked(RoguetimerDB.bars[def.key] ~= false)
+    local text = row.Text or row.text or _G[rowName .. "Text"]
+    if text then
+      text:SetText("")
+      text:Hide()
     end
     row:SetScript("OnClick", function()
-      setValue(not getValue())
+      RoguetimerDB.bars[def.key] = row:GetChecked() and true or false
+      UpdateBars()
+    end)
+
+    local icon = panel:CreateTexture(nil, "ARTWORK")
+    icon:SetSize(20, 20)
+    icon:SetPoint("LEFT", row, "RIGHT", 5, 0)
+    icon:SetTexture("Interface\\Icons\\" .. def.tex)
+    icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+
+    local name = panel:CreateFontString(nil, "OVERLAY")
+    name:SetPoint("LEFT", icon, "RIGHT", 6, 0)
+    name:SetWidth(205)
+    name:SetJustifyH("LEFT")
+    SetOptionText(name, label, 12)
+
+    local swatch = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+    swatch:SetSize(36, 22)
+    swatch:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -88, y + 1)
+    swatch:SetText("")
+    swatch.texture = swatch:CreateTexture(nil, "ARTWORK")
+    swatch.texture:SetTexture(BAR_TEX)
+    swatch.texture:SetPoint("TOPLEFT", swatch, "TOPLEFT", 4, -4)
+    swatch.texture:SetPoint("BOTTOMRIGHT", swatch, "BOTTOMRIGHT", -4, 4)
+
+    local reset = CreatePanelButton(panel, "Reset", 58, 22)
+    reset:SetPoint("LEFT", swatch, "RIGHT", 5, 0)
+
+    local function RefreshColor()
+      local color = GetBarColor(def.key)
+      swatch.texture:SetVertexColor(color[1], color[2], color[3], 1)
+      UpdateBars()
+    end
+    local function SetColor(r, g, b)
+      RoguetimerDB.colors[def.key] = {
+        math.max(0, math.min(1, r)),
+        math.max(0, math.min(1, g)),
+        math.max(0, math.min(1, b)),
+      }
+      RefreshColor()
+    end
+    swatch:SetScript("OnClick", function()
+      local picker = ColorPickerFrame
+      if not picker then
+        DEFAULT_CHAT_FRAME:AddMessage("Roguetimer: this client has no color picker.")
+        return
+      end
+      local color = GetBarColor(def.key)
+      local previous = { r = color[1], g = color[2], b = color[3] }
+      local function RestoreColor(oldColor)
+        if oldColor then SetColor(oldColor.r, oldColor.g, oldColor.b) end
+      end
+      if type(picker.SetupColorPickerAndShow) == "function" then
+        picker:SetupColorPickerAndShow({
+          r = color[1], g = color[2], b = color[3], hasOpacity = false,
+          swatchFunc = function()
+            local r, g, b = picker:GetColorRGB()
+            SetColor(r, g, b)
+          end,
+          cancelFunc = RestoreColor,
+        })
+      else
+        picker.hasOpacity = false
+        picker.func = function()
+          local r, g, b = picker:GetColorRGB()
+          SetColor(r, g, b)
+        end
+        picker.cancelFunc = RestoreColor
+        picker.previousValues = previous
+        picker:SetColorRGB(color[1], color[2], color[3])
+        picker:Show()
+      end
+    end)
+    reset:SetScript("OnClick", function()
+      local color = DEFAULTS.colors[def.key]
+      SetColor(color[1], color[2], color[3])
+    end)
+    RefreshColor()
+  end
+
+  for index, def in ipairs(DEFS) do
+    RoguetimerDB.bars[def.key] = RoguetimerDB.bars[def.key] ~= false
+    AddTrackedBarRow(def, index, ({
+      SND = "Slice and Dice",
+      RUP = "Rupture",
+      GAR = "Garrote",
+      EXP = "Expose Armor",
+    })[def.key])
+  end
+
+  AddSectionHeading("DISPLAY & SIZE", -194)
+  local function AddToggle(label, y, getValue, setValue)
+    local toggleIndex = (FB.toggleIndex or 0) + 1
+    FB.toggleIndex = toggleIndex
+    local rowName = "RoguetimerOptionToggle" .. toggleIndex
+    local row = CreateFrame("CheckButton", rowName, panel, "InterfaceOptionsCheckButtonTemplate")
+    row:SetPoint("TOPLEFT", panel, "TOPLEFT", 12, y)
+    row:SetChecked(getValue())
+    local text = row.Text or row.text or _G[rowName .. "Text"]
+    if text then
+      text:SetText(label)
+      text:SetFont(STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF", 12, "")
+    else
+      local labelText = row:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+      labelText:SetPoint("LEFT", row, "RIGHT", 2, 0)
+      labelText:SetFont(STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF", 12, "")
+      labelText:SetText(label)
+    end
+    local function Refresh()
+      row:SetChecked(getValue())
+    end
+    row:SetScript("OnClick", function()
+      setValue(row:GetChecked() and true or false)
       Refresh()
       UpdateBars()
     end)
@@ -485,36 +697,23 @@ local function CreateOptions()
     return row
   end
 
-  for index, def in ipairs(DEFS) do
-    RoguetimerDB.bars[def.key] = RoguetimerDB.bars[def.key] ~= false
-    AddToggle(def.key .. "  -  " .. ({
-      SND = "Slice and Dice",
-      RUP = "Rupture",
-      GAR = "Garrote",
-      EXP = "Expose Armor",
-    })[def.key], -96 - (index - 1) * 30,
-      function() return RoguetimerDB.bars[def.key] end,
-      function(value) RoguetimerDB.bars[def.key] = value end,
-      def.tex)
-  end
-
-  AddSectionHeading("DISPLAY & SIZE", -226)
-  AddToggle("Hide bars without an active timer", -246,
+  AddToggle("Hide bars without an active timer", -210,
     function() return not RoguetimerDB.showInactive end,
-    function(value) RoguetimerDB.showInactive = not value end,
-    "INV_Misc_PocketWatch_01")
+    function(value) RoguetimerDB.showInactive = not value end)
 
   local function AddSizeControl(label, y, key, minimum, maximum, step)
     local text = panel:CreateFontString(nil, "OVERLAY")
     text:SetPoint("TOPLEFT", panel, "TOPLEFT", 24, y)
-    SetOptionText(text, label, 11, { 0.84, 0.88, 0.94 })
+    SetOptionText(text, label, 12)
     local value = panel:CreateFontString(nil, "OVERLAY")
-    value:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -64, y)
-    SetOptionText(value, tostring(RoguetimerDB[key]), 11, { 1, 0.78, 0.32 })
+    value:SetWidth(42)
+    value:SetJustifyH("CENTER")
+    SetOptionText(value, tostring(RoguetimerDB[key]), 12)
     local minus = CreatePanelButton(panel, "-", 24, 22)
-    minus:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -42, y + 4)
     local plus = CreatePanelButton(panel, "+", 24, 22)
-    plus:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -14, y + 4)
+    plus:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -18, y + 1)
+    value:SetPoint("RIGHT", plus, "LEFT", -6, 0)
+    minus:SetPoint("RIGHT", value, "LEFT", -6, 0)
     local function Adjust(direction)
       RoguetimerDB[key] = math.max(minimum, math.min(maximum, RoguetimerDB[key] + step * direction))
       value:SetText(tostring(RoguetimerDB[key]))
@@ -525,19 +724,14 @@ local function CreateOptions()
     plus:SetScript("OnClick", function() Adjust(1) end)
   end
 
-  AddSizeControl("Bar width", -286, "width", 100, 420, 20)
-  AddSizeControl("Bar height", -316, "height", 12, 36, 2)
+  AddSizeControl("Bar width", -238, "width", 100, 420, 20)
+  AddSizeControl("Bar height", -264, "height", 12, 36, 2)
 
-  AddSectionHeading("BAR POSITION", -356)
-  local lock = CreatePanelButton(panel, "", 274, 26)
-  lock:SetWidth(314)
-  lock:SetPoint("TOPLEFT", panel, "TOPLEFT", 18, -376)
-  lock.label:SetText("")
-  lock.status = lock:CreateFontString(nil, "OVERLAY")
-  lock.status:SetPoint("CENTER", lock, "CENTER", 0, 0)
+  AddSectionHeading("BAR POSITION", -294)
+  local lock = CreatePanelButton(panel, "", 184, 26)
+  lock:SetPoint("TOPLEFT", panel, "TOPLEFT", 18, -312)
   local function RefreshLock()
-    local label = RoguetimerDB.locked and "Position locked" or "Drag bars to move"
-    SetOptionText(lock.status, label, 11, { 0.9, 0.82, 0.61 })
+    lock:SetText(RoguetimerDB.locked and "Unlock Position" or "Lock Position")
   end
   lock:SetScript("OnClick", function()
     RoguetimerDB.locked = not RoguetimerDB.locked
@@ -566,30 +760,29 @@ local function CreateOptions()
     SetAnchorPosition(x, y)
   end
 
-  local centerVertical = CreatePanelButton(panel, "CENTER VERTICALLY", 152, 27)
-  centerVertical:SetPoint("TOPLEFT", panel, "TOPLEFT", 18, -416)
-  centerVertical.label:SetFont(FB.optionFont, 10, "OUTLINE")
+  local centerVertical = CreatePanelButton(panel, "Center Vertically", 184, 26)
+  centerVertical:SetPoint("TOPLEFT", panel, "TOPLEFT", 18, -344)
   centerVertical:SetScript("OnClick", function() CenterAnchor("vertical") end)
 
-  local centerHorizontal = CreatePanelButton(panel, "CENTER HORIZONTALLY", 152, 27)
-  centerHorizontal:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -18, -416)
-  centerHorizontal.label:SetFont(FB.optionFont, 10, "OUTLINE")
+  local centerHorizontal = CreatePanelButton(panel, "Center Horizontally", 184, 26)
+  centerHorizontal:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -18, -344)
   centerHorizontal:SetScript("OnClick", function() CenterAnchor("horizontal") end)
 
-  local resetPosition = CreatePanelButton(panel, "RESET BAR POSITION", 314, 27)
-  resetPosition:SetPoint("TOPLEFT", panel, "TOPLEFT", 18, -450)
+  local resetPosition = CreatePanelButton(panel, "Reset Position", 184, 26)
+  resetPosition:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -18, -312)
   resetPosition:SetScript("OnClick", function()
     RoguetimerDB.x, RoguetimerDB.y = nil, nil
     FB.anchor:ClearAllPoints()
     FB.anchor:SetPoint("CENTER", UIParent, "CENTER", 0, -100)
   end)
-  local footer = panel:CreateFontString(nil, "OVERLAY")
-  footer:SetPoint("BOTTOM", panel, "BOTTOM", 0, 18)
-  SetOptionText(footer, "Changes apply immediately", 9, { 0.55, 0.62, 0.7 })
   panel:Hide()
+  local function OpenOptions()
+    panel:Show()
+  end
+  FB.openOptions = OpenOptions
 
   if Minimap then
-    local button = CreateFrame("Button", "RoguetimerMinimapButton", Minimap)
+    local button = CreateFrame("Button", "RoguetimerMinimapButton", UIParent)
     FB.minimapButton = button
     button:SetWidth(32)
     button:SetHeight(32)
@@ -645,6 +838,11 @@ local function CreateOptions()
       local x, y = GetCursorPosition()
       local mx, my = Minimap:GetCenter()
       local scale = Minimap:GetEffectiveScale()
+      if type(x) ~= "number" or type(y) ~= "number"
+        or type(mx) ~= "number" or type(my) ~= "number"
+        or type(scale) ~= "number" or scale <= 0 then
+        return
+      end
       local dx, dy = x / scale - mx, y / scale - my
       local angle
       if type(math.atan2) == "function" then
@@ -662,18 +860,29 @@ local function CreateOptions()
     end
     local dragging = false
     button:SetScript("OnDragStart", function()
+      if type(InCombatLockdown) == "function" and InCombatLockdown() then
+        DebugMessage("minimap button drag ignored during combat")
+        return
+      end
       dragging = true
     end)
     button:SetScript("OnUpdate", function()
-      if dragging then UpdateMinimapButtonPosition() end
+      if dragging then
+        if type(InCombatLockdown) == "function" and InCombatLockdown() then
+          dragging = false
+          return
+        end
+        UpdateMinimapButtonPosition()
+      end
     end)
     button:SetScript("OnDragStop", function()
+      if not dragging then return end
       dragging = false
       UpdateMinimapButtonPosition()
     end)
     PositionMinimapButton()
     button:SetScript("OnClick", function()
-      if panel:IsShown() then panel:Hide() else panel:Show() end
+      OpenOptions()
     end)
     button:SetScript("OnEnter", function()
       if GameTooltip then
@@ -691,49 +900,91 @@ end
 
 UpdateBars = function()
   local db = RoguetimerDB
-  if FB.inBattleground then
-    FB.anchor:Hide()
-    return
-  end
+  FB.anchor:Show()
   local now = GetTime()
   local W = db.width
   local cp = GetCP()
   local targetExists = SafeUnitExists("target")
   local targetIsDead = false
   if targetExists and type(UnitIsDeadOrGhost) == "function" then
-    local isDead = UnitIsDeadOrGhost("target")
-    if not IsSecretValue(isDead) and isDead == true then targetIsDead = true end
+    local ok, isDead = pcall(UnitIsDeadOrGhost, "target")
+    if not ok then
+      ReportApiError("UnitIsDeadOrGhost", isDead)
+    elseif not IsSecretValue(isDead) and isDead == true then
+      targetIsDead = true
+    end
   end
   if targetExists and not targetIsDead and type(UnitIsDead) == "function" then
-    local isDead = UnitIsDead("target")
-    if not IsSecretValue(isDead) and isDead == true then targetIsDead = true end
+    local ok, isDead = pcall(UnitIsDead, "target")
+    if not ok then
+      ReportApiError("UnitIsDead", isDead)
+    elseif not IsSecretValue(isDead) and isDead == true then
+      targetIsDead = true
+    end
   end
   local targetAlive = targetExists and not targetIsDead
   local targetKey = targetExists and UnitTimerKey("target") or nil
+  local exposeKey = FB.lastExposeKey
+  local exposeTimer = exposeKey and FB.timers[exposeKey] and FB.timers[exposeKey].EXP
+  if exposeTimer and exposeTimer.start + exposeTimer.dur <= now then
+    FB.timers[exposeKey].EXP = nil
+    exposeTimer = nil
+    FB.lastExposeKey = nil
+  end
+  if not exposeTimer then
+    local newestStart = 0
+    for unitKey, timers in pairs(FB.timers) do
+      local timer = timers.EXP
+      if timer and timer.start + timer.dur > now and timer.start > newestStart then
+        newestStart = timer.start
+        exposeKey, exposeTimer = unitKey, timer
+      elseif timer then
+        timers.EXP = nil
+      end
+    end
+    FB.lastExposeKey = exposeKey
+  end
   local activeRuptures = {}
+  local activeGarrotes = {}
   local currentTargetRupture
+  local currentTargetGarrote
 
   if targetExists and not targetAlive and targetKey and FB.timers[targetKey] then
     FB.timers[targetKey].RUP = nil
     FB.timers[targetKey].GAR = nil
+    FB.timers[targetKey].EXP = nil
+    if FB.lastExposeKey == targetKey then
+      FB.lastExposeKey = nil
+      exposeKey, exposeTimer = nil, nil
+    end
   end
 
   if targetAlive and targetKey and FB.timers[targetKey] then
     currentTargetRupture = FB.timers[targetKey].RUP
+    currentTargetGarrote = FB.timers[targetKey].GAR
   end
 
   for unitKey, timers in pairs(FB.timers) do
-    local timer = timers.RUP
-    if timer and timer.start + timer.dur > now then
+    local rupture = timers.RUP
+    if rupture and rupture.start + rupture.dur > now then
       table.insert(activeRuptures, {
         key = unitKey,
-        timer = timer,
+        timer = rupture,
       })
-    elseif timer then
+    elseif rupture then
       timers.RUP = nil
+    end
+    local garrote = timers.GAR
+    if garrote and garrote.start + garrote.dur > now then
+      table.insert(activeGarrotes, { key = unitKey, timer = garrote })
+    elseif garrote then
+      timers.GAR = nil
     end
   end
   table.sort(activeRuptures, function(a, b)
+    return tostring(a.key) < tostring(b.key)
+  end)
+  table.sort(activeGarrotes, function(a, b)
     return tostring(a.key) < tostring(b.key)
   end)
 
@@ -741,6 +992,7 @@ UpdateBars = function()
     local def = f.def
     local remaining, ghost = 0, 0
     local enabled = db.bars[def.key] ~= false
+    ApplyBarColor(f)
 
     if def.key == "SND" then
       local playerKey = UnitTimerKey("player")
@@ -750,6 +1002,14 @@ UpdateBars = function()
       end
     elseif def.key == "RUP" and currentTargetRupture then
       remaining = math.max(0, currentTargetRupture.start + currentTargetRupture.dur - now)
+    elseif def.key == "GAR" and currentTargetGarrote then
+      remaining = math.max(0, currentTargetGarrote.start + currentTargetGarrote.dur - now)
+    elseif def.key == "GAR" then
+      for _, garrote in ipairs(activeGarrotes) do
+        remaining = math.max(remaining, garrote.timer.start + garrote.timer.dur - now)
+      end
+    elseif def.key == "EXP" and exposeTimer then
+      remaining = math.max(0, exposeTimer.start + exposeTimer.dur - now)
     elseif targetKey and FB.timers[targetKey] and FB.timers[targetKey][def.key] then
       local tm = FB.timers[targetKey][def.key]
       remaining = tm.start + tm.dur - now
@@ -762,6 +1022,13 @@ UpdateBars = function()
     if enabled and (remaining > 0 or ghost > 0 or db.showInactive or not db.locked) then
       f:Show()
       if f.bg then f.bg:Show() end
+      if f.inactiveOverlay then
+        if remaining > 0 and targetKey ~= exposeKey then
+          f.inactiveOverlay:Show()
+        else
+          f.inactiveOverlay:Hide()
+        end
+      end
       local gw = math.min(ghost, MAXTIME) / MAXTIME * W
       local fw = math.min(remaining, MAXTIME) / MAXTIME * W
       if gw >= 1 then f.ghost:SetWidth(gw); f.ghost:Show() else f.ghost:Hide() end
@@ -787,9 +1054,9 @@ UpdateBars = function()
               layer:SetHeight(f:GetHeight())
               f.ruptureLayers[layerIndex] = layer
             end
-            local paletteIndex = (layerIndex - 1) % 5 + 1
-            local shade = RUPTURE_SHADES[paletteIndex]
-            layer:SetVertexColor(shade[1], shade[2], shade[3], shade[4])
+            layer.alpha = 0.35 + ((layerIndex - 1) % 5) * 0.1
+            local color = GetBarColor(def.key)
+            layer:SetVertexColor(color[1], color[2], color[3], layer.alpha)
             local layerWidth = math.min(
               rupture.timer.start + rupture.timer.dur - now, MAXTIME) / MAXTIME * W
             if layerWidth >= 1 then
@@ -802,6 +1069,52 @@ UpdateBars = function()
         end
         for i = layerIndex + 1, #f.ruptureLayers do
           f.ruptureLayers[i]:Hide()
+        end
+      elseif def.key == "GAR" then
+        local visibleGarrotes = {}
+        local primaryGarrote = currentTargetGarrote
+        if not primaryGarrote and activeGarrotes[1] then
+          primaryGarrote = activeGarrotes[1].timer
+        end
+        for _, garrote in ipairs(activeGarrotes) do
+          if garrote.timer ~= primaryGarrote then
+            table.insert(visibleGarrotes, garrote)
+          end
+        end
+        local layerIndex = 0
+        for _, garrote in ipairs(visibleGarrotes) do
+          layerIndex = layerIndex + 1
+          local layer = f.garroteLayers[layerIndex]
+          if not layer then
+            layer = f:CreateTexture(nil, "ARTWORK")
+            layer:SetTexture(BAR_TEX)
+            layer:SetPoint("TOPLEFT", f, "TOPLEFT", 0, 0)
+            layer:SetHeight(f:GetHeight())
+            f.garroteLayers[layerIndex] = layer
+          end
+          layer.alpha = 0.35 + ((layerIndex - 1) % 5) * 0.1
+          local color = GetBarColor(def.key)
+          layer:SetVertexColor(color[1], color[2], color[3], layer.alpha)
+          local layerWidth = math.min(
+            garrote.timer.start + garrote.timer.dur - now, MAXTIME) / MAXTIME * W
+          if layerWidth >= 1 then
+            layer:SetWidth(layerWidth)
+            layer:Show()
+          else
+            layer:Hide()
+          end
+        end
+        for i = layerIndex + 1, #f.garroteLayers do
+          f.garroteLayers[i]:Hide()
+        end
+        local currentWidth = primaryGarrote
+          and math.min(primaryGarrote.start + primaryGarrote.dur - now, MAXTIME) / MAXTIME * W
+          or 0
+        if primaryGarrote and currentWidth >= 1 then
+          f.fill:SetWidth(currentWidth)
+          f.fill:Show()
+        else
+          f.fill:Hide()
         end
       elseif fw >= 1 then
         f.fill:SetWidth(fw)
@@ -816,6 +1129,9 @@ UpdateBars = function()
         f.fill:Hide()
         if f.ruptureCurrentFill then f.ruptureCurrentFill:Hide() end
         for _, layer in ipairs(f.ruptureLayers or {}) do layer:Hide() end
+      elseif def.key == "GAR" then
+        f.fill:Hide()
+        for _, layer in ipairs(f.garroteLayers or {}) do layer:Hide() end
       end
       f:Hide()
     end
@@ -843,22 +1159,15 @@ local active = false
 
 local function RefreshInstanceState()
   local inBattleground = IsInBattleground()
-  if inBattleground == FB.inBattleground then return end
-  FB.inBattleground = inBattleground
-  if inBattleground then
-    FB.timers = {}
-    FB.pendingCP = 0
-    FB.pendingTarget = nil
-    FB.lastTargetKey = nil
-    FB.anchor:Hide()
-  else
-    FB.anchor:Show()
-    TrackComboPoints()
-    UpdateBars()
+  if inBattleground ~= FB.inBattleground then
+    FB.inBattleground = inBattleground
+    DebugMessage("battleground state changed: " .. tostring(inBattleground))
   end
+  TrackComboPoints()
+  UpdateBars()
 end
 
-ev:SetScript("OnEvent", function(self, e, a1, ...)
+local function HandleEvent(self, e, a1, ...)
   e = e or event
   a1 = a1 or arg1
   if e == "ADDON_LOADED" then
@@ -870,6 +1179,7 @@ ev:SetScript("OnEvent", function(self, e, a1, ...)
       end
     end
     ForeverBarsDB = nil
+    if type(RoguetimerDB.colors) ~= "table" then RoguetimerDB.colors = {} end
     if type(RoguetimerDB.settingsVersion) ~= "number" or RoguetimerDB.settingsVersion < 1 then
       RoguetimerDB.locked = DEFAULTS.locked
       RoguetimerDB.settingsVersion = 1
@@ -883,7 +1193,20 @@ ev:SetScript("OnEvent", function(self, e, a1, ...)
       RoguetimerDB.settingsVersion = 3
     end
     for k, v in pairs(DEFAULTS) do
-      if RoguetimerDB[k] == nil then RoguetimerDB[k] = v end
+      if k ~= "colors" and RoguetimerDB[k] == nil then RoguetimerDB[k] = v end
+    end
+    for _, def in ipairs(DEFS) do
+      local color = RoguetimerDB.colors[def.key]
+      if type(color) ~= "table"
+        or type(color[1]) ~= "number" or color[1] < 0 or color[1] > 1
+        or type(color[2]) ~= "number" or color[2] < 0 or color[2] > 1
+        or type(color[3]) ~= "number" or color[3] < 0 or color[3] > 1 then
+        RoguetimerDB.colors[def.key] = {
+          DEFAULTS.colors[def.key][1],
+          DEFAULTS.colors[def.key][2],
+          DEFAULTS.colors[def.key][3],
+        }
+      end
     end
     if type(RoguetimerDB.width) ~= "number" then RoguetimerDB.width = DEFAULTS.width end
     if type(RoguetimerDB.height) ~= "number" then RoguetimerDB.height = DEFAULTS.height end
@@ -914,25 +1237,34 @@ ev:SetScript("OnEvent", function(self, e, a1, ...)
   elseif e == "ZONE_CHANGED_NEW_AREA" then
     RefreshInstanceState()
   elseif e == "PLAYER_TARGET_CHANGED" then
-    if FB.inBattleground then return end
     FB.targetGeneration = FB.targetGeneration + 1
     FB.pendingCP = 0
     FB.pendingTarget = nil
     TrackComboPoints()
+    DebugMessage("target changed: " .. tostring(FB.lastTargetKey))
     UpdateBars()
   elseif e == "PLAYER_TALENT_UPDATE" then
     ScanTalents()
   elseif e == "UNIT_SPELLCAST_SUCCEEDED" then
-    if FB.inBattleground then return end
     TrackFinisherCast(a1, ...)
   end
+end
+
+ev:SetScript("OnEvent", function(...)
+  return RunWithDiagnostics("event", HandleEvent, ...)
 end)
 
-ev:SetScript("OnUpdate", function(self, elapsed)
+local function HandleUpdate(self, elapsed)
   if not active then return end
-  if FB.inBattleground then return end
+  FB.updateElapsed = (FB.updateElapsed or 0) + (elapsed or 0)
+  if FB.updateElapsed < 0.1 then return end
+  FB.updateElapsed = FB.updateElapsed % 0.1
   TrackComboPoints()
   UpdateBars()
+end
+
+ev:SetScript("OnUpdate", function(...)
+  return RunWithDiagnostics("update", HandleUpdate, ...)
 end)
 
 ------------------------------------------------------------
@@ -946,18 +1278,21 @@ SlashCmdList["ROGUETIMER"] = function(msg)
   if cmd == "unlock" then db.locked = false; Layout(); UpdateBars()
   elseif cmd == "lock" then db.locked = true; Layout(); UpdateBars()
   elseif cmd == "debug" then
-    FB.debugSnd = not FB.debugSnd
-    DEFAULT_CHAT_FRAME:AddMessage("Roguetimer diagnostics " .. (FB.debugSnd and "enabled" or "disabled"))
+    FB.debug = not FB.debug
+    DEFAULT_CHAT_FRAME:AddMessage("Roguetimer diagnostics " .. (FB.debug and "enabled" or "disabled"))
     DebugInitialization()
+    DebugState()
+  elseif cmd == "status" then
+    DebugState()
   elseif cmd == "width" and tonumber(val) then db.width = tonumber(val); Layout()
   elseif cmd == "height" and tonumber(val) then db.height = tonumber(val); Layout()
   elseif cmd == "options" then
-    FB.options:Show()
+    FB.openOptions()
   elseif cmd == "reset" or cmd == "center" then
     db.x, db.y = nil, nil
     FB.anchor:ClearAllPoints()
     FB.anchor:SetPoint("CENTER", UIParent, "CENTER", 0, -100)
   else
-    DEFAULT_CHAT_FRAME:AddMessage("Roguetimer: /roguetimer options | unlock | lock | debug | width N | height N | center")
+    DEFAULT_CHAT_FRAME:AddMessage("Roguetimer: /roguetimer options | unlock | lock | debug | status | width N | height N | center")
   end
 end
