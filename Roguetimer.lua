@@ -5,13 +5,14 @@
 local MAXTIME = 30
 local BAR_TEX = "Interface\\Buttons\\WHITE8X8"
 
--- Identify spells by icon path (language-independent).
+-- Identify spells by ID where available; custom abilities can be matched by name.
 -- finisher consumes combo points; scaled duration depends on combo points.
 local DEFS = {
-  { key = "SND", tex = "Ability_Rogue_SliceDice", spellIDs = { 5171, 6774 }, color = { 1.00, 0.85, 0.10 }, finisher = true, scaled = true },
+  { key = "SND", tex = "Ability_Rogue_SliceDice", spellIDs = { 5171, 6774 }, color = { 1.00, 0.85, 0.10 }, finisher = true, scaled = true, playerTimer = true },
   { key = "RUP", tex = "Ability_Rogue_Rupture", spellIDs = { 1943, 8639, 8640, 11273, 11274, 11275 }, color = { 1.00, 0.30, 0.30 }, finisher = true, scaled = true },
   { key = "EXP", tex = "Ability_Warrior_Riposte", spellIDs = { 8647, 8649, 8650, 11197, 11198 }, color = { 0.45, 0.55, 0.80 }, finisher = true, scaled = true },
-  { key = "GAR", tex = "Ability_Rogue_Garrote", spellIDs = { 703, 8631, 8632, 8633, 11289, 11290, 26839, 26884 }, color = { 0.55, 0.05, 0.05 }, fixed = 18, finisher = true },
+  { key = "GAR", tex = "Ability_Rogue_Garrote", spellIDs = { 703, 8631, 8632, 8633, 11289, 11290, 26839, 26884 }, color = { 0.55, 0.05, 0.05 }, fixed = 18, finisher = true, defaultEnabled = false },
+  { key = "VEN", tex = "INV_Sword_31", spellIDs = { 1310703 }, spellName = "Venom", color = { 0.25, 0.82, 0.30 }, finisher = true, scaled = true, playerTimer = true, defaultEnabled = false },
 }
 
 local DEFAULTS = {
@@ -20,6 +21,8 @@ local DEFAULTS = {
   spacing = 4,
   locked = true,
   showInactive = true,
+  showIcons = true,
+  showSnDEfficiency = true,
   colors = {},
 }
 
@@ -42,6 +45,31 @@ local FB = {
 for _, d in ipairs(DEFS) do
   FB.defByKey[d.key] = d
   DEFAULTS.colors[d.key] = { d.color[1], d.color[2], d.color[3] }
+end
+
+local function NormalizeBarOrder()
+  local order, seen = {}, {}
+  local savedOrder = type(RoguetimerDB.barOrder) == "table" and RoguetimerDB.barOrder or {}
+  for _, key in ipairs(savedOrder) do
+    if FB.defByKey[key] and not seen[key] then
+      table.insert(order, key)
+      seen[key] = true
+    end
+  end
+  for _, def in ipairs(DEFS) do
+    if not seen[def.key] then
+      table.insert(order, def.key)
+    end
+  end
+  RoguetimerDB.barOrder = order
+end
+
+local function GetOrderedDefinitions()
+  local ordered = {}
+  for _, key in ipairs(RoguetimerDB.barOrder) do
+    table.insert(ordered, FB.defByKey[key])
+  end
+  return ordered
 end
 
 local function GetBarColor(key)
@@ -151,6 +179,7 @@ local function Duration(def, cp)
   if def.key == "SND" then return (6 + 3 * cp) * (1 + FB.sndBonus)
   elseif def.key == "RUP" then return 6 + 2 * cp
   elseif def.key == "EXP" then return 30
+  elseif def.key == "VEN" then return 6 + 3 * cp
   else return def.fixed end
 end
 
@@ -338,6 +367,33 @@ local function TrackFinisherCast(unit, castGUID, spellID)
     end
     if def then break end
   end
+  if not def and type(spellID) == "number" then
+    local spellName
+    if C_Spell and type(C_Spell.GetSpellInfo) == "function" then
+      local ok, info = pcall(C_Spell.GetSpellInfo, spellID)
+      if ok and type(info) == "table" then
+        spellName = info.name
+      elseif not ok then
+        ReportApiError("C_Spell.GetSpellInfo", info)
+      end
+    end
+    if not spellName and type(GetSpellInfo) == "function" then
+      local ok, name = pcall(GetSpellInfo, spellID)
+      if ok then
+        spellName = name
+      else
+        ReportApiError("GetSpellInfo", name)
+      end
+    end
+    if type(spellName) == "string" then
+      for _, candidate in ipairs(DEFS) do
+        if candidate.spellName and string.lower(spellName) == string.lower(candidate.spellName) then
+          def = candidate
+          break
+        end
+      end
+    end
+  end
   if not def then return end
 
   local cp = FB.pendingCP
@@ -345,7 +401,7 @@ local function TrackFinisherCast(unit, castGUID, spellID)
   cp = math.max(1, math.min(5, cp or 1))
   local now = GetTime()
   local key
-  if def.key == "SND" then
+  if def.playerTimer then
     key = UnitTimerKey("player")
   else
     key = FB.lastTargetKey
@@ -360,7 +416,7 @@ local function TrackFinisherCast(unit, castGUID, spellID)
     source = "UNIT_SPELLCAST_SUCCEEDED",
   }
   if def.key == "EXP" then FB.lastExposeKey = key end
-  DebugMessage(string.format("%s applied to %s for %.1fs (%d combo points)",
+  DebugMessage(string.format("%s cast succeeded on %s; tracking for %.1fs (%d combo points)",
     def.key, tostring(key), duration, cp))
   FB.pendingCP = 0
   if FB.debug and DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
@@ -377,13 +433,15 @@ end
 local function Layout()
   local db = RoguetimerDB
   local W, H, S = db.width, db.height, db.spacing
-  FB.anchor:SetWidth(W + H + 3)
-  FB.anchor:SetHeight(#DEFS * (H + S))
+  local iconOffset = H + 3
+  FB.anchor:SetWidth(W + iconOffset)
+  FB.anchor:SetHeight(#FB.bars * (H + S))
   for i, f in ipairs(FB.bars) do
     f:SetWidth(W); f:SetHeight(H)
     f:ClearAllPoints()
-    f:SetPoint("TOPLEFT", FB.anchor, "TOPLEFT", H + 3, -(i - 1) * (H + S))
+    f:SetPoint("TOPLEFT", FB.anchor, "TOPLEFT", iconOffset, -(i - 1) * (H + S))
     f.icon:SetWidth(H); f.icon:SetHeight(H)
+    if db.showIcons ~= false then f.icon:Show() else f.icon:Hide() end
     f.ghost:SetHeight(H); f.fill:SetHeight(H)
     if f.ruptureCurrentFill then f.ruptureCurrentFill:SetHeight(H) end
     for _, layer in ipairs(f.ruptureLayers or {}) do
@@ -406,6 +464,29 @@ local function Layout()
 end
 
 local UpdateBars
+
+local function MoveBarOrder(key, direction)
+  for index, orderedKey in ipairs(RoguetimerDB.barOrder) do
+    if orderedKey == key then
+      local targetIndex = index + direction
+      if targetIndex < 1 or targetIndex > #RoguetimerDB.barOrder then return false end
+      RoguetimerDB.barOrder[index], RoguetimerDB.barOrder[targetIndex] =
+        RoguetimerDB.barOrder[targetIndex], RoguetimerDB.barOrder[index]
+      local barsByKey = {}
+      for _, bar in ipairs(FB.bars) do
+        barsByKey[bar.def.key] = bar
+      end
+      FB.bars = {}
+      for _, orderedDefinition in ipairs(GetOrderedDefinitions()) do
+        table.insert(FB.bars, barsByKey[orderedDefinition.key])
+      end
+      Layout()
+      UpdateBars()
+      return true
+    end
+  end
+  return false
+end
 
 local function BuildUI()
   local db = RoguetimerDB
@@ -437,7 +518,7 @@ local function BuildUI()
   end
   a:SetScript("OnDragStop", SaveAnchorPosition)
 
-  for i, def in ipairs(DEFS) do
+  for i, def in ipairs(GetOrderedDefinitions()) do
     local f = CreateFrame("Frame", nil, a)
     f.def = def
     if not f.bg then
@@ -510,7 +591,7 @@ local function CreateOptions()
   local panel = CreateFrame("Frame", "RoguetimerOptions", UIParent)
   FB.options = panel
   panel:SetWidth(440)
-  panel:SetHeight(410)
+  panel:SetHeight(480)
   panel:SetFrameStrata("DIALOG")
   panel:SetClampedToScreen(true)
   panel:EnableMouse(true)
@@ -548,7 +629,7 @@ local function CreateOptions()
   SetOptionText(title, "Roguetimer", 14)
   local description = panel:CreateFontString(nil, "OVERLAY")
   description:SetPoint("LEFT", title, "RIGHT", 12, 0)
-  SetOptionText(description, "Timer and display settings", 12)
+  SetOptionText(description, "Options", 14)
   local close = CreateFrame("Button", nil, panel, "UIPanelCloseButton")
   close:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -5, -5)
   close:SetScript("OnClick", function() panel:Hide() end)
@@ -559,7 +640,29 @@ local function CreateOptions()
     SetOptionText(heading, text, 12)
   end
 
-  AddSectionHeading("TRACKED TIMERS / BAR COLORS", -56)
+  AddSectionHeading("TRACKED TIMERS + CUSTOMIZATION", -56)
+
+  local trackedRows = {}
+  local function RefreshTrackedRowPositions()
+    for index, def in ipairs(GetOrderedDefinitions()) do
+      local controls = trackedRows[def.key]
+      local y = -72 - (index - 1) * 28
+      controls.row:ClearAllPoints()
+      controls.row:SetPoint("TOPLEFT", panel, "TOPLEFT", 12, y)
+      controls.icon:ClearAllPoints()
+      controls.icon:SetPoint("LEFT", controls.row, "RIGHT", 5, 0)
+      controls.name:ClearAllPoints()
+      controls.name:SetPoint("LEFT", controls.icon, "RIGHT", 6, 0)
+      controls.swatch:ClearAllPoints()
+      controls.swatch:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -88, y + 1)
+      controls.reset:ClearAllPoints()
+      controls.reset:SetPoint("LEFT", controls.swatch, "RIGHT", 5, 0)
+      controls.up:ClearAllPoints()
+      controls.up:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -164, y + 1)
+      controls.down:ClearAllPoints()
+      controls.down:SetPoint("LEFT", controls.up, "RIGHT", 2, 0)
+    end
+  end
 
   local function AddTrackedBarRow(def, index, label)
     local toggleIndex = (FB.toggleIndex or 0) + 1
@@ -588,9 +691,14 @@ local function CreateOptions()
 
     local name = panel:CreateFontString(nil, "OVERLAY")
     name:SetPoint("LEFT", icon, "RIGHT", 6, 0)
-    name:SetWidth(205)
+    name:SetWidth(180)
     name:SetJustifyH("LEFT")
     SetOptionText(name, label, 12)
+
+    local up = CreatePanelButton(panel, "Up", 40, 22)
+    up:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -140, y + 1)
+    local down = CreatePanelButton(panel, "Down", 40, 22)
+    down:SetPoint("LEFT", up, "RIGHT", 2, 0)
 
     local swatch = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
     swatch:SetSize(36, 22)
@@ -653,21 +761,37 @@ local function CreateOptions()
       local color = DEFAULTS.colors[def.key]
       SetColor(color[1], color[2], color[3])
     end)
+    up:SetScript("OnClick", function()
+      if MoveBarOrder(def.key, -1) then RefreshTrackedRowPositions() end
+    end)
+    down:SetScript("OnClick", function()
+      if MoveBarOrder(def.key, 1) then RefreshTrackedRowPositions() end
+    end)
+    trackedRows[def.key] = {
+      row = row,
+      icon = icon,
+      name = name,
+      up = up,
+      down = down,
+      swatch = swatch,
+      reset = reset,
+    }
     RefreshColor()
   end
 
-  for index, def in ipairs(DEFS) do
-    RoguetimerDB.bars[def.key] = RoguetimerDB.bars[def.key] ~= false
+  for index, def in ipairs(GetOrderedDefinitions()) do
     AddTrackedBarRow(def, index, ({
       SND = "Slice and Dice",
       RUP = "Rupture",
       GAR = "Garrote",
       EXP = "Expose Armor",
+      VEN = "Venom",
     })[def.key])
   end
+  RefreshTrackedRowPositions()
 
-  AddSectionHeading("DISPLAY & SIZE", -194)
-  local function AddToggle(label, y, getValue, setValue)
+  AddSectionHeading("DISPLAY & SIZE", -222)
+  local function AddToggle(label, y, getValue, setValue, relayout)
     local toggleIndex = (FB.toggleIndex or 0) + 1
     FB.toggleIndex = toggleIndex
     local rowName = "RoguetimerOptionToggle" .. toggleIndex
@@ -690,6 +814,7 @@ local function CreateOptions()
     row:SetScript("OnClick", function()
       setValue(row:GetChecked() and true or false)
       Refresh()
+      if relayout then Layout() end
       UpdateBars()
     end)
     row.Refresh = Refresh
@@ -697,9 +822,28 @@ local function CreateOptions()
     return row
   end
 
-  AddToggle("Hide bars without an active timer", -210,
+  AddToggle("Hide bars without an active timer", -235,
     function() return not RoguetimerDB.showInactive end,
     function(value) RoguetimerDB.showInactive = not value end)
+  AddToggle("Show icons beside bars", -260,
+    function() return RoguetimerDB.showIcons end,
+    function(value) RoguetimerDB.showIcons = value end,
+    true)
+  local sndEfficiencyToggle = AddToggle("Color SnD prediction by refresh efficiency", -285,
+    function() return RoguetimerDB.showSnDEfficiency end,
+    function(value) RoguetimerDB.showSnDEfficiency = value end)
+  sndEfficiencyToggle:SetScript("OnEnter", function(self)
+    if GameTooltip then
+      GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+      GameTooltip:AddLine("SnD refresh-efficiency proxy", 1, 0.82, 0.2)
+      GameTooltip:AddLine("Green means less current SnD time would be lost by refreshing.", 0.85, 0.88, 0.94)
+      GameTooltip:AddLine("This estimates uptime opportunity cost, not actual DPS.", 0.85, 0.88, 0.94)
+      GameTooltip:Show()
+    end
+  end)
+  sndEfficiencyToggle:SetScript("OnLeave", function()
+    if GameTooltip then GameTooltip:Hide() end
+  end)
 
   local function AddSizeControl(label, y, key, minimum, maximum, step)
     local text = panel:CreateFontString(nil, "OVERLAY")
@@ -724,12 +868,12 @@ local function CreateOptions()
     plus:SetScript("OnClick", function() Adjust(1) end)
   end
 
-  AddSizeControl("Bar width", -238, "width", 100, 420, 20)
-  AddSizeControl("Bar height", -264, "height", 12, 36, 2)
+  AddSizeControl("Bar width", -322, "width", 100, 420, 20)
+  AddSizeControl("Bar height", -348, "height", 12, 36, 2)
 
-  AddSectionHeading("BAR POSITION", -294)
+  AddSectionHeading("BAR POSITION", -378)
   local lock = CreatePanelButton(panel, "", 184, 26)
-  lock:SetPoint("TOPLEFT", panel, "TOPLEFT", 18, -312)
+  lock:SetPoint("TOPLEFT", panel, "TOPLEFT", 18, -396)
   local function RefreshLock()
     lock:SetText(RoguetimerDB.locked and "Unlock Position" or "Lock Position")
   end
@@ -761,15 +905,15 @@ local function CreateOptions()
   end
 
   local centerVertical = CreatePanelButton(panel, "Center Vertically", 184, 26)
-  centerVertical:SetPoint("TOPLEFT", panel, "TOPLEFT", 18, -344)
+  centerVertical:SetPoint("TOPLEFT", panel, "TOPLEFT", 18, -428)
   centerVertical:SetScript("OnClick", function() CenterAnchor("vertical") end)
 
   local centerHorizontal = CreatePanelButton(panel, "Center Horizontally", 184, 26)
-  centerHorizontal:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -18, -344)
+  centerHorizontal:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -18, -428)
   centerHorizontal:SetScript("OnClick", function() CenterAnchor("horizontal") end)
 
   local resetPosition = CreatePanelButton(panel, "Reset Position", 184, 26)
-  resetPosition:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -18, -312)
+  resetPosition:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -18, -396)
   resetPosition:SetScript("OnClick", function()
     RoguetimerDB.x, RoguetimerDB.y = nil, nil
     FB.anchor:ClearAllPoints()
@@ -994,7 +1138,7 @@ UpdateBars = function()
     local enabled = db.bars[def.key] ~= false
     ApplyBarColor(f)
 
-    if def.key == "SND" then
+    if def.playerTimer then
       local playerKey = UnitTimerKey("player")
       if FB.timers[playerKey] and FB.timers[playerKey][def.key] then
         local timer = FB.timers[playerKey][def.key]
@@ -1031,6 +1175,16 @@ UpdateBars = function()
       end
       local gw = math.min(ghost, MAXTIME) / MAXTIME * W
       local fw = math.min(remaining, MAXTIME) / MAXTIME * W
+      if def.key == "SND" then
+        f.ghost:ClearAllPoints()
+        f.ghost:SetPoint("TOPLEFT", f, "TOPLEFT", 0, 0)
+        gw = math.min(ghost, MAXTIME) / MAXTIME * W
+        if db.showSnDEfficiency and ghost > 0 then
+          local lostDuration = math.min(remaining, ghost)
+          local efficiency = 1 - lostDuration / ghost
+          f.ghost:SetVertexColor(1 - efficiency, efficiency, 0, 0.35)
+        end
+      end
       if gw >= 1 then f.ghost:SetWidth(gw); f.ghost:Show() else f.ghost:Hide() end
       if def.key == "RUP" then
         f.fill:Hide()
@@ -1216,12 +1370,38 @@ local function HandleEvent(self, e, a1, ...)
     RoguetimerDB.spacing = math.max(0, math.min(20, RoguetimerDB.spacing))
     if type(RoguetimerDB.locked) ~= "boolean" then RoguetimerDB.locked = DEFAULTS.locked end
     if type(RoguetimerDB.showInactive) ~= "boolean" then RoguetimerDB.showInactive = DEFAULTS.showInactive end
+    if type(RoguetimerDB.showIcons) ~= "boolean" then RoguetimerDB.showIcons = DEFAULTS.showIcons end
+    if type(RoguetimerDB.showSnDEfficiency) ~= "boolean" then
+      RoguetimerDB.showSnDEfficiency = DEFAULTS.showSnDEfficiency
+    end
+    if RoguetimerDB.settingsVersion < 4 then
+      -- Keep bars at their old screen position when reserving space for hidden icons.
+      if not RoguetimerDB.showIcons and type(RoguetimerDB.x) == "number" then
+        RoguetimerDB.x = RoguetimerDB.x - RoguetimerDB.height - 3
+      end
+      RoguetimerDB.settingsVersion = 4
+    end
+    if RoguetimerDB.settingsVersion < 5 then
+      local venomColor = RoguetimerDB.colors.VEN
+      if type(venomColor) == "table"
+        and venomColor[1] == 0.60 and venomColor[2] == 0.80 and venomColor[3] == 0.35 then
+        RoguetimerDB.colors.VEN = {
+          DEFAULTS.colors.VEN[1],
+          DEFAULTS.colors.VEN[2],
+          DEFAULTS.colors.VEN[3],
+        }
+      end
+      RoguetimerDB.settingsVersion = 5
+    end
     RoguetimerDB.showBackground = nil
     RoguetimerDB.backgroundAlpha = nil
     if type(RoguetimerDB.bars) ~= "table" then RoguetimerDB.bars = {} end
     for _, def in ipairs(DEFS) do
-      if RoguetimerDB.bars[def.key] == nil then RoguetimerDB.bars[def.key] = true end
+      if RoguetimerDB.bars[def.key] == nil then
+        RoguetimerDB.bars[def.key] = def.defaultEnabled ~= false
+      end
     end
+    NormalizeBarOrder()
     local _, class = UnitClass("player")
     if class ~= "ROGUE" then return end
     active = true

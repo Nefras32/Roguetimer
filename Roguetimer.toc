@@ -1,8 +1,8 @@
 ## Interface: 16001
 ## Title: Roguetimer
-## Notes: Tracks Rogue finishers with options for timers, bar size, spacing, visibility, and position. Open options via the minimap button or /roguetimer options.
+## Notes: Tracks Rogue finishers including Venom, with customizable bars and an optional Slice and Dice refresh-efficiency prediction.
 ## Author: -
-## Version: 0.3
+## Version: 0.3.6
 ## SavedVariables: RoguetimerDB, ForeverBarsDB
 
 Roguetimer.lua
