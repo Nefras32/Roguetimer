@@ -1,6 +1,12 @@
--- Roguetimer 0.2
+-- Roguetimer 0.4
 -- Rogue timers for the Forever WoW 1.60 client (Interface 16001).
--- Starts finisher timers from successful spellcast events.
+--
+-- 0.3: a successful cast is no longer proof that a debuff landed. Expose Armor
+-- (and Rupture / Garrote) casts are held as "pending" and only become timers once
+-- the debuff is confirmed on the target. Expose Armor additionally gets an
+-- engine-drawn overlay (Blizzard's CustomAuraContainerTemplate) that reads the real
+-- aura itself, so it stays correct in combat and in dungeons where GUIDs, names and
+-- aura data are secret values the addon cannot read.
 
 local MAXTIME = 30
 local BAR_TEX = "Interface\\Buttons\\WHITE8X8"
@@ -9,9 +15,9 @@ local BAR_TEX = "Interface\\Buttons\\WHITE8X8"
 -- finisher consumes combo points; scaled duration depends on combo points.
 local DEFS = {
   { key = "SND", tex = "Ability_Rogue_SliceDice", spellIDs = { 5171, 6774 }, color = { 1.00, 0.85, 0.10 }, finisher = true, scaled = true, playerTimer = true },
-  { key = "RUP", tex = "Ability_Rogue_Rupture", spellIDs = { 1943, 8639, 8640, 11273, 11274, 11275 }, color = { 1.00, 0.30, 0.30 }, finisher = true, scaled = true },
-  { key = "EXP", tex = "Ability_Warrior_Riposte", spellIDs = { 8647, 8649, 8650, 11197, 11198 }, color = { 0.45, 0.55, 0.80 }, finisher = true, scaled = true },
-  { key = "GAR", tex = "Ability_Rogue_Garrote", spellIDs = { 703, 8631, 8632, 8633, 11289, 11290, 26839, 26884 }, color = { 0.55, 0.05, 0.05 }, fixed = 18, finisher = true, defaultEnabled = false },
+  { key = "RUP", tex = "Ability_Rogue_Rupture", spellIDs = { 1943, 8639, 8640, 11273, 11274, 11275 }, color = { 1.00, 0.30, 0.30 }, finisher = true, scaled = true, verify = true },
+  { key = "EXP", tex = "Ability_Warrior_Riposte", spellIDs = { 8647, 8649, 8650, 11197, 11198 }, color = { 0.45, 0.55, 0.80 }, finisher = true, scaled = true, verify = true, native = true },
+  { key = "GAR", tex = "Ability_Rogue_Garrote", spellIDs = { 703, 8631, 8632, 8633, 11289, 11290, 26839, 26884 }, color = { 0.55, 0.05, 0.05 }, fixed = 18, finisher = true, defaultEnabled = false, verify = true },
   { key = "VEN", tex = "INV_Sword_31", spellIDs = { 1310703 }, spellName = "Venom", color = { 0.25, 0.82, 0.30 }, finisher = true, scaled = true, playerTimer = true, defaultEnabled = false },
 }
 
@@ -23,6 +29,7 @@ local DEFAULTS = {
   showInactive = true,
   showIcons = true,
   showSnDEfficiency = true,
+  nativeOverlay = true,   -- engine-drawn Expose Armor overlay; "/roguetimer native off" disables it
   colors = {},
 }
 
@@ -41,6 +48,7 @@ local FB = {
   lastExposeKey = nil,
   debug = false,
   lastErrors = {},
+  pending = {},     -- pending[defKey] = { time, key, def }: cast succeeded, debuff not confirmed yet
 }
 for _, d in ipairs(DEFS) do
   FB.defByKey[d.key] = d
@@ -96,6 +104,17 @@ local function ApplyBarColor(bar)
   end
   for _, layer in ipairs(bar.garroteLayers or {}) do
     layer:SetVertexColor(color[1], color[2], color[3], layer.alpha or 0.55)
+  end
+  local native = bar.native
+  if native and native.full then
+    -- The visible colour lives on our own full-width texture; the engine-driven StatusBar on
+    -- top is only a background-coloured mask. pcall: the frame is engine-managed, and an
+    -- unchanged colour does not need repeating.
+    local signature = color[1] .. "," .. color[2] .. "," .. color[3]
+    if native.colorSignature ~= signature then
+      native.colorSignature = signature
+      pcall(native.full.SetVertexColor, native.full, color[1], color[2], color[3], 0.95)
+    end
   end
 end
 
@@ -262,6 +281,218 @@ local function IsInBattleground()
   return false
 end
 
+
+------------------------------------------------------------
+-- Debuff confirmation
+--
+-- UNIT_SPELLCAST_SUCCEEDED only says the cast finished. It fires for casts that are then
+-- dodged, parried, missed, resisted or hit an immune target, so it cannot start a timer
+-- for a debuff by itself. Casts of `verify` spells wait here until the debuff shows up.
+------------------------------------------------------------
+local CONFIRM_WINDOW = 1.5   -- seconds to wait for the aura after the cast
+local FRESH_SLACK = 0.75     -- the aura must have been applied no earlier than cast time minus this
+
+-- Timer keys are GUIDs or names where the client shows them. Where it hides them
+-- (dungeons, battlegrounds) UnitTimerKey falls back to "target:<n>", which changes on
+-- every target swap and says nothing about which enemy it is.
+local function IsStableKey(key)
+  return type(key) == "string" and string.sub(key, 1, 7) ~= "target:"
+end
+
+-- While aura secrecy is active, UnitAura-family getters return a secret or nothing, so an
+-- empty result is only evidence of "no debuff" when the client says aura data is readable.
+-- Preferred sources, most exact first (all documented on the Warcraft Wiki):
+--   C_Secrets.ShouldSpellAuraBeSecret(spellID)  - per spell; spells can be flagged never/always
+--                                                 secret, and that overrides the restriction state
+--   C_Secrets.ShouldAurasBeSecret()             - aura queries are secret right now
+-- Fallback when neither exists: any aura-relevant restriction state (combat, encounter,
+-- challenge mode, PvP match) or being in combat counts as untrusted. The "Map" restriction
+-- does not make auras secret by itself, so it is skipped.
+local function AuraReadsTrusted(def)
+  if C_Secrets and def and type(C_Secrets.ShouldSpellAuraBeSecret) == "function" then
+    local answered = false
+    for _, id in ipairs(def.spellIDs or {}) do
+      local ok, secret = pcall(C_Secrets.ShouldSpellAuraBeSecret, id)
+      if ok and not IsSecretValue(secret) and type(secret) == "boolean" then
+        answered = true
+        if secret then return false end
+      end
+    end
+    if answered then return true end
+  end
+  if C_Secrets and type(C_Secrets.ShouldAurasBeSecret) == "function" then
+    local ok, secret = pcall(C_Secrets.ShouldAurasBeSecret)
+    if ok and not IsSecretValue(secret) and type(secret) == "boolean" then return not secret end
+  end
+  for _, api in ipairs({ "InCombatLockdown", "UnitAffectingCombat" }) do
+    local fn = _G[api]
+    if type(fn) == "function" then
+      local ok, value
+      if api == "UnitAffectingCombat" then ok, value = pcall(fn, "player") else ok, value = pcall(fn) end
+      if not ok or IsSecretValue(value) or value == true then return false end
+    end
+  end
+  if C_RestrictedActions and type(C_RestrictedActions.GetAddOnRestrictionState) == "function"
+    and Enum and type(Enum.AddOnRestrictionType) == "table" then
+    for name, restrictionType in pairs(Enum.AddOnRestrictionType) do
+      if name ~= "Map" then
+        local ok, state = pcall(C_RestrictedActions.GetAddOnRestrictionState, restrictionType)
+        if not ok or IsSecretValue(state) or (type(state) == "number" and state ~= 0) then
+          return false
+        end
+      end
+    end
+  end
+  return true
+end
+
+local function DefIDSet(def)
+  if not def.idSet then
+    def.idSet = {}
+    for _, id in ipairs(def.spellIDs or {}) do def.idSet[id] = true end
+  end
+  return def.idSet
+end
+
+-- Returns "present", expirationTime, duration  |  "absent"  |  "unknown"
+-- "unknown" means the client would not let us read it (secret value, error, no API).
+local function ReadPlayerDebuff(def)
+  if type(UnitExists) ~= "function" then return "unknown" end
+  local existsOK, exists = pcall(UnitExists, "target")
+  if not existsOK or IsSecretValue(exists) then return "unknown" end
+  if exists ~= true then return "absent" end
+
+  local bestExpiration, bestDuration
+  local function Consider(aura)
+    -- returns false when the aura's fields cannot be read
+    if type(aura) ~= "table" then return false end
+    -- A table can be flagged inaccessible to tainted code; indexing it raises an error.
+    if type(canaccesstable) == "function" and not canaccesstable(aura) then return false end
+    local expiration, duration, mine = aura.expirationTime, aura.duration, aura.isFromPlayerOrPlayerPet
+    if IsSecretValue(expiration) or IsSecretValue(duration)
+      or type(expiration) ~= "number" or type(duration) ~= "number" or duration <= 0 then
+      return false
+    end
+    if not IsSecretValue(mine) and mine == false then return true end -- someone else's
+    if not bestExpiration or expiration > bestExpiration then
+      bestExpiration, bestDuration = expiration, duration
+    end
+    return true
+  end
+
+  if C_UnitAuras and type(C_UnitAuras.GetUnitAuraBySpellID) == "function" then
+    for _, id in ipairs(def.spellIDs or {}) do
+      local ok, aura = pcall(C_UnitAuras.GetUnitAuraBySpellID, "target", id)
+      if not ok then ReportApiError("GetUnitAuraBySpellID", aura); return "unknown" end
+      if IsSecretValue(aura) then return "unknown" end
+      if aura ~= nil then
+        local considered, readable = pcall(Consider, aura)
+        if not considered or not readable then return "unknown" end
+      end
+    end
+  elseif C_UnitAuras and type(C_UnitAuras.GetAuraDataByIndex) == "function" then
+    local ids = DefIDSet(def)
+    for index = 1, 40 do
+      local ok, aura = pcall(C_UnitAuras.GetAuraDataByIndex, "target", index, "HARMFUL|PLAYER")
+      if not ok then ReportApiError("GetAuraDataByIndex", aura); return "unknown" end
+      if IsSecretValue(aura) then return "unknown" end
+      if aura == nil then break end
+      if type(aura) ~= "table" then return "unknown" end
+      local spellId = aura.spellId
+      if IsSecretValue(spellId) or type(spellId) ~= "number" then return "unknown" end
+      if ids[spellId] then
+        local considered, readable = pcall(Consider, aura)
+        if not considered or not readable then return "unknown" end
+      end
+    end
+  else
+    return "unknown"
+  end
+
+  if bestExpiration then return "present", bestExpiration, bestDuration end
+  return "absent"
+end
+
+local function CommitTimer(def, key, startTime, duration, source, unverified)
+  FB.timers[key] = FB.timers[key] or {}
+  FB.timers[key][def.key] = {
+    start = startTime,
+    dur = duration,
+    source = source,
+    unverified = unverified or nil,
+  }
+  if def.key == "EXP" then FB.lastExposeKey = key end
+  DebugMessage(string.format("%s timer started on %s (%s): %.1fs",
+    def.key, tostring(key), tostring(source), duration))
+end
+
+local function IsNativeActive(def)
+  return def and def.native and RoguetimerDB.nativeOverlay ~= false
+    and FB.nativeStatus and FB.nativeStatus[def.key]
+    and FB.nativeStatus[def.key].active == true
+end
+
+local ResolvePending
+ResolvePending = function()
+  if next(FB.pending) == nil then return end
+  local now = GetTime()
+  for defKey, pending in pairs(FB.pending) do
+    local def = pending.def
+    local trusted = AuraReadsTrusted(def)
+    -- The aura is read from "target", so the pending cast is only checkable while the
+    -- target is still the one it was cast on.
+    if FB.lastTargetKey ~= pending.key then
+      FB.pending[defKey] = nil
+      DebugMessage(defKey .. " pending cast dropped: target changed before confirmation")
+    else
+      local state, expiration, duration = ReadPlayerDebuff(def)
+      if state == "present" and expiration - duration >= pending.time - FRESH_SLACK then
+        -- Real application time and real duration straight from the aura.
+        CommitTimer(def, pending.key, expiration - duration, duration, "aura confirmed")
+        RoguetimerDB.verifiedAuras[defKey] = true
+        FB.pending[defKey] = nil
+      else
+        if state == "unknown"
+          or (state == "absent" and (not trusted or not RoguetimerDB.verifiedAuras[defKey])) then
+          -- Not evidence either way: restricted, secret, or never seen this aura readable yet.
+          pending.unreadable = true
+          if not pending.provisional and not IsNativeActive(def) then
+            -- The aura cannot be read (combat / secret values), so waiting would only delay
+            -- the bar by the whole confirm window. Start it right away from the cast time;
+            -- a later readable aura replaces it with the real values, and a readable "absent"
+            -- at the end of the window rolls it back.
+            pending.provisional = true
+            local existing = FB.timers[pending.key] and FB.timers[pending.key][defKey]
+            pending.previous = existing and {
+              start = existing.start, dur = existing.dur,
+              source = existing.source, unverified = existing.unverified,
+            } or false
+            CommitTimer(def, pending.key, pending.time, Duration(def, pending.cp),
+              "cast (provisional)", true)
+          end
+        end
+        if now - pending.time > CONFIRM_WINDOW then
+          FB.pending[defKey] = nil
+          if pending.provisional then
+            local disproved = state == "absent" and trusted and RoguetimerDB.verifiedAuras[defKey]
+            if disproved then
+              FB.timers[pending.key] = FB.timers[pending.key] or {}
+              FB.timers[pending.key][defKey] = pending.previous or nil
+              DebugMessage(defKey .. " provisional timer rolled back: no debuff appeared")
+            end
+          elseif pending.unreadable then
+            -- The engine overlay shows the truth for the current target; adding a guess
+            -- on top is what produced false Expose Armor timers.
+            DebugMessage(defKey .. " unconfirmable by addon; engine overlay is authoritative")
+          else
+            DebugMessage(defKey .. " cast succeeded but no debuff appeared (miss, dodge, resist or immune)")
+          end
+        end
+      end
+    end
+  end
+end
+
 local function TrackComboPoints()
   local targetKey
   if SafeUnitExists("target") then
@@ -355,6 +586,11 @@ end
 
 local function TrackFinisherCast(unit, castGUID, spellID)
   if unit ~= "player" then return end
+  -- A secret spell ID cannot be compared (that raises an error), so it cannot be identified.
+  if IsSecretValue(spellID) then
+    DebugMessage("player cast with a secret spell ID ignored")
+    return
+  end
   local def
   for _, candidate in ipairs(DEFS) do
     if candidate.finisher then
@@ -408,16 +644,19 @@ local function TrackFinisherCast(unit, castGUID, spellID)
   end
   if not key then return end
 
-  FB.timers[key] = FB.timers[key] or {}
+  if def.verify and not def.playerTimer then
+    -- Do not start (or reset) anything yet: the cast may still have missed. An existing
+    -- timer keeps running until the new application is confirmed.
+    FB.pending[def.key] = { time = now, key = key, cp = cp, def = def }
+    FB.pendingCP = 0
+    DebugMessage(string.format("%s cast succeeded on %s; waiting for the debuff to appear",
+      def.key, tostring(key)))
+    ResolvePending()
+    return
+  end
+
   local duration = Duration(def, cp)
-  FB.timers[key][def.key] = {
-    start = now,
-    dur = duration,
-    source = "UNIT_SPELLCAST_SUCCEEDED",
-  }
-  if def.key == "EXP" then FB.lastExposeKey = key end
-  DebugMessage(string.format("%s cast succeeded on %s; tracking for %.1fs (%d combo points)",
-    def.key, tostring(key), duration, cp))
+  CommitTimer(def, key, now, duration, "UNIT_SPELLCAST_SUCCEEDED")
   FB.pendingCP = 0
   if FB.debug and DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
     local expiration = now + duration
@@ -430,6 +669,179 @@ end
 ------------------------------------------------------------
 -- UI
 ------------------------------------------------------------
+------------------------------------------------------------
+-- Engine-drawn aura overlay
+--
+-- Blizzard_AuraContainer's CustomAuraContainerTemplate reads the target's auras inside the
+-- engine and writes icon, duration bar and time text into the widgets we hand it. The addon
+-- never sees a value, so this keeps working where aura data, GUIDs and names are secret
+-- (combat, dungeons). Because the engine only shows an aura that really exists, a missed
+-- Expose Armor can never show up here.
+--
+-- API shape (AddAuraSlot / SetIcon / SetDurationBar / SetDurationText) is taken from the
+-- Warcraft Wiki's AuraContainer and AuraButton pages. candidateFilters.includeSpellIDs
+-- (a set keyed by spell ID) comes from Blizzard_AuraContainerUtil.lua. The option tables of
+-- SetDurationBar / SetDurationText are not documented, so every step is pcall'd and
+-- reported by "/roguetimer native".
+------------------------------------------------------------
+FB.nativeStatus = {}
+
+-- The engine appends a unit letter ("s") to the duration text and offers no option to drop it.
+-- The text lives in a clipping frame and is pushed right by the width of one "s", so the
+-- number ends exactly at the clip edge and the trailing "s" is cut off.
+local function ApplyNativeTextOffset(native)
+  if not (native and native.text and native.clip and native.measure) then return end
+  local font = STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF"
+  local size = math.max(8, RoguetimerDB.height - 6)
+  pcall(native.text.SetFont, native.text, font, size, "OUTLINE")
+  pcall(native.measure.SetFont, native.measure, font, size, "OUTLINE")
+  pcall(native.measure.SetText, native.measure, "s")
+  local ok, width = pcall(native.measure.GetStringWidth, native.measure)
+  if not ok or type(width) ~= "number" then width = size * 0.5 end
+  pcall(native.text.ClearAllPoints, native.text)
+  pcall(native.text.SetPoint, native.text, "RIGHT", native.clip, "RIGHT", width + 1, 0)
+end
+
+local function LayoutNative(bar)
+  local native = bar.native
+  if not native then return end
+  local W, H = RoguetimerDB.width, RoguetimerDB.height
+  if native.container then
+    pcall(native.container.SetSize, native.container, W, H)
+    pcall(native.container.ClearAllPoints, native.container)
+    pcall(native.container.SetPoint, native.container, "TOPLEFT", bar, "TOPLEFT", 0, 0)
+  end
+  if native.frame then
+    pcall(native.frame.SetSize, native.frame, W, H)
+    pcall(native.frame.ClearAllPoints, native.frame)
+    pcall(native.frame.SetPoint, native.frame, "TOPLEFT", native.container or bar, "TOPLEFT", 0, 0)
+  end
+  -- Widgets handed to the aura button are engine-managed; touch them defensively.
+  if native.icon then
+    pcall(native.icon.SetWidth, native.icon, H)
+    pcall(native.icon.SetHeight, native.icon, H)
+    if RoguetimerDB.showIcons ~= false then pcall(native.icon.Show, native.icon)
+    else pcall(native.icon.Hide, native.icon) end
+  end
+  ApplyNativeTextOffset(native)
+end
+
+local function InitNativeFrame(bar, status, frame, step)
+  status.frame = frame
+
+  status.bg = frame:CreateTexture(nil, "BACKGROUND")
+  status.bg:SetTexture(BAR_TEX)
+  status.bg:SetVertexColor(0.035, 0.045, 0.06, 0.9)
+  status.bg:SetAllPoints(frame)
+
+  -- The engine drives the duration bar with the ELAPSED time (empty -> full). We want the
+  -- opposite (full on application, draining towards the left), so the engine bar is used as
+  -- a mask: a full-width coloured texture sits underneath, and the engine bar is filled from
+  -- the right in the background colour. Elapsed fraction e covers [1-e, 1], which leaves
+  -- [0, 1-e] of the coloured texture visible = the remaining time, anchored left.
+  status.full = frame:CreateTexture(nil, "ARTWORK")
+  status.full:SetTexture(BAR_TEX)
+  status.full:SetAllPoints(frame)
+
+  status.bar = CreateFrame("StatusBar", nil, frame)
+  status.bar:SetAllPoints(frame)
+  status.bar:SetStatusBarTexture(BAR_TEX)
+  status.bar:SetStatusBarColor(0.035, 0.045, 0.06, 1)  -- mask colour, never changes
+  status.bar:SetMinMaxValues(0, 1)
+  status.bar:SetValue(0)
+  -- Must be set before the bar is handed to the engine; it owns the bar afterwards.
+  step("SetReverseFill", pcall(status.bar.SetReverseFill, status.bar, true))
+
+  status.icon = frame:CreateTexture(nil, "ARTWORK")
+  status.icon:SetTexture("Interface\\Icons\\" .. bar.def.tex)
+  status.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+  status.icon:SetPoint("RIGHT", frame, "LEFT", -3, 0)
+
+  status.clip = CreateFrame("Frame", nil, status.bar)
+  status.clip:SetPoint("TOPLEFT", status.bar, "TOPLEFT", 0, 0)
+  status.clip:SetPoint("BOTTOMRIGHT", status.bar, "BOTTOMRIGHT", -4, 0)
+  pcall(status.clip.SetClipsChildren, status.clip, true)
+
+  status.text = status.clip:CreateFontString(nil, "OVERLAY")
+  status.text:SetJustifyH("RIGHT")
+  status.text:SetPoint("RIGHT", status.clip, "RIGHT", 0, 0)
+  status.measure = status.clip:CreateFontString(nil, "OVERLAY")
+  status.measure:Hide()
+  -- Font and offset are set before the text is handed to the engine, which owns it afterwards.
+  ApplyNativeTextOffset(status)
+
+  if type(frame.SetIcon) == "function" then
+    step("SetIcon", pcall(frame.SetIcon, frame, status.icon))
+  end
+  if type(frame.SetDurationBar) == "function" then
+    local ok, err = pcall(frame.SetDurationBar, frame, status.bar)
+    if not ok then ok, err = pcall(frame.SetDurationBar, frame, status.bar, {}) end
+    step("SetDurationBar", ok, err)
+  end
+  if type(frame.SetDurationText) == "function" then
+    local ok, err = pcall(frame.SetDurationText, frame, status.text)
+    if not ok then ok, err = pcall(frame.SetDurationText, frame, status.text, {}) end
+    step("SetDurationText", ok, err)
+  end
+  LayoutNative(bar)
+end
+
+local function BuildNativeTracker(bar)
+  local def = bar.def
+  local status = { steps = {}, active = false }
+  bar.native = status
+  FB.nativeStatus[def.key] = status
+
+  local function step(name, ok, err)
+    table.insert(status.steps, name .. ": " .. (ok and "ok" or ("FAILED - " .. tostring(err))))
+    return ok
+  end
+
+  if type(CreateFrame) ~= "function" then return end
+  local ok, container = pcall(CreateFrame, "AuraContainer", nil, bar, "CustomAuraContainerTemplate")
+  if not step("CreateFrame(AuraContainer)", ok and container ~= nil, container) then return end
+  status.container = container
+  pcall(container.SetEnabled, container, false)
+  -- The template declares no size and a zero-sized container never renders.
+  LayoutNative(bar)
+  if not step("SetUnit(target)", pcall(container.SetUnit, container, "target")) then return end
+
+  local slotOK, slotResult = pcall(container.AddAuraSlot, container, def.key, "HARMFUL|PLAYER", {
+    -- Blizzard_AuraContainerUtil.DoesAuraPassCandidateFilters reads includeSpellIDs as a SET
+    -- ([spellID] = true). Without it every HARMFUL|PLAYER debuff (Hemorrhage, Cheap Shot, ...)
+    -- would take over this slot.
+    candidateFilters = { includeSpellIDs = DefIDSet(def) },
+    initializeFrame = function(frame)
+      local initOK, initErr = pcall(InitNativeFrame, bar, status, frame, step)
+      step("initializeFrame", initOK, initErr)
+    end,
+  })
+  if not step("AddAuraSlot(HARMFUL|PLAYER)", slotOK, slotResult) then return end
+  if not status.frame and type(slotResult) == "table" then
+    -- initializeFrame was not called synchronously: configure the returned frame ourselves.
+    local initOK, initErr = pcall(InitNativeFrame, bar, status, slotResult, step)
+    step("configure returned slot frame", initOK, initErr)
+  end
+  local enabledOK, enabledErr = pcall(container.SetEnabled, container, true)
+  step("SetEnabled(true)", enabledOK, enabledErr)
+  status.active = enabledOK and status.frame ~= nil and status.bar ~= nil
+  if RoguetimerDB.nativeOverlay == false then
+    pcall(container.SetEnabled, container, false)
+    pcall(container.Hide, container)
+  end
+  ApplyBarColor(bar)
+end
+
+local function SetNativeOverlayEnabled(enabled)
+  RoguetimerDB.nativeOverlay = enabled and true or false
+  for _, status in pairs(FB.nativeStatus) do
+    if status.container then
+      pcall(status.container.SetEnabled, status.container, enabled)
+      pcall(status.container.SetShown, status.container, enabled)
+    end
+  end
+end
+
 local function Layout()
   local db = RoguetimerDB
   local W, H, S = db.width, db.height, db.spacing
@@ -448,6 +860,7 @@ local function Layout()
       layer:SetHeight(H)
     end
     f.text:SetFont(STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF", math.max(8, H - 6), "OUTLINE")
+    if f.native then LayoutNative(f) end
   end
   FB.anchor:EnableMouse(not db.locked)
   if type(FB.anchor.RegisterForDrag) == "function" then
@@ -563,6 +976,7 @@ local function BuildUI()
     f.text:SetPoint("RIGHT", f, "RIGHT", -4, 0)
     f:Show()
     FB.bars[i] = f
+    if def.native then BuildNativeTracker(f) end
     ApplyBarColor(f)
   end
   Layout()
@@ -1136,6 +1550,7 @@ UpdateBars = function()
     local def = f.def
     local remaining, ghost = 0, 0
     local enabled = db.bars[def.key] ~= false
+    local nativeActive = IsNativeActive(def)
     ApplyBarColor(f)
 
     if def.playerTimer then
@@ -1154,18 +1569,29 @@ UpdateBars = function()
       end
     elseif def.key == "EXP" and exposeTimer then
       remaining = math.max(0, exposeTimer.start + exposeTimer.dur - now)
+      if nativeActive then
+        -- The engine overlay is the truth for whatever is targeted. The addon's remembered
+        -- timer is only drawn when we positively know the target is a different enemy.
+        local otherTarget = (not targetKey)
+          or (IsStableKey(targetKey) and IsStableKey(exposeKey) and targetKey ~= exposeKey)
+        if not otherTarget then remaining = 0 end
+      end
     elseif targetKey and FB.timers[targetKey] and FB.timers[targetKey][def.key] then
       local tm = FB.timers[targetKey][def.key]
       remaining = tm.start + tm.dur - now
       if remaining < 0 then remaining = 0 end
     end
-    if def.key ~= "GAR" and targetAlive and (not def.finisher or cp > 0) then
+    if def.key ~= "GAR" and not nativeActive and targetAlive and (not def.finisher or cp > 0) then
       ghost = Duration(def, cp)
     end
 
-    if enabled and (remaining > 0 or ghost > 0 or db.showInactive or not db.locked) then
+    if enabled and (remaining > 0 or ghost > 0 or db.showInactive or not db.locked or nativeActive) then
       f:Show()
-      if f.bg then f.bg:Show() end
+      if f.bg then
+        -- With "hide inactive bars" the engine-drawn background (which only exists while the
+        -- debuff does) replaces the addon's always-visible one.
+        if nativeActive and not db.showInactive and db.locked then f.bg:Hide() else f.bg:Show() end
+      end
       if f.inactiveOverlay then
         if remaining > 0 and targetKey ~= exposeKey then
           f.inactiveOverlay:Show()
@@ -1277,7 +1703,15 @@ UpdateBars = function()
         f.fill:Hide()
       end
       local displayed = remaining > 0 and remaining or ghost
-      if displayed > 0 then f.text:SetText(string.format("%.1f", displayed)) else f.text:SetText("") end
+      if displayed > 0 then
+        local suffix = ""
+        if def.key == "EXP" and remaining > 0 and exposeTimer and exposeTimer.unverified then
+          suffix = "?" -- started from the cast alone; the debuff could not be confirmed
+        end
+        f.text:SetText(string.format("%.1f%s", displayed, suffix))
+      else
+        f.text:SetText("")
+      end
     else
       if def.key == "RUP" then
         f.fill:Hide()
@@ -1308,6 +1742,11 @@ RegisterEvent("PLAYER_TARGET_CHANGED")
 RegisterEvent("ZONE_CHANGED_NEW_AREA")
 RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 RegisterEvent("PLAYER_TALENT_UPDATE")
+do
+  local registered = type(ev.RegisterUnitEvent) == "function"
+    and pcall(ev.RegisterUnitEvent, ev, "UNIT_AURA", "target")
+  if not registered then RegisterEvent("UNIT_AURA") end
+end
 
 local active = false
 
@@ -1334,6 +1773,7 @@ local function HandleEvent(self, e, a1, ...)
     end
     ForeverBarsDB = nil
     if type(RoguetimerDB.colors) ~= "table" then RoguetimerDB.colors = {} end
+    if type(RoguetimerDB.verifiedAuras) ~= "table" then RoguetimerDB.verifiedAuras = {} end
     if type(RoguetimerDB.settingsVersion) ~= "number" or RoguetimerDB.settingsVersion < 1 then
       RoguetimerDB.locked = DEFAULTS.locked
       RoguetimerDB.settingsVersion = 1
@@ -1420,11 +1860,17 @@ local function HandleEvent(self, e, a1, ...)
     FB.targetGeneration = FB.targetGeneration + 1
     FB.pendingCP = 0
     FB.pendingTarget = nil
+    if next(FB.pending) ~= nil then
+      DebugMessage("pending cast dropped: target changed before confirmation")
+    end
+    FB.pending = {}
     TrackComboPoints()
     DebugMessage("target changed: " .. tostring(FB.lastTargetKey))
     UpdateBars()
   elseif e == "PLAYER_TALENT_UPDATE" then
     ScanTalents()
+  elseif e == "UNIT_AURA" then
+    if not IsSecretValue(a1) and a1 == "target" then ResolvePending() end
   elseif e == "UNIT_SPELLCAST_SUCCEEDED" then
     TrackFinisherCast(a1, ...)
   end
@@ -1440,6 +1886,7 @@ local function HandleUpdate(self, elapsed)
   if FB.updateElapsed < 0.1 then return end
   FB.updateElapsed = FB.updateElapsed % 0.1
   TrackComboPoints()
+  ResolvePending()
   UpdateBars()
 end
 
@@ -1464,6 +1911,39 @@ SlashCmdList["ROGUETIMER"] = function(msg)
     DebugState()
   elseif cmd == "status" then
     DebugState()
+  elseif cmd == "native" then
+    local out = function(text) DEFAULT_CHAT_FRAME:AddMessage("Roguetimer: " .. text) end
+    if val == "off" or val == "on" then
+      SetNativeOverlayEnabled(val == "on")
+      out("engine overlay " .. val .. (val == "off"
+        and " - Expose Armor falls back to addon timers, marked ? when the debuff cannot be confirmed" or ""))
+      return
+    end
+    out("engine overlay setting: " .. tostring(db.nativeOverlay ~= false))
+    out("addon aura reads trusted right now (EXP): " .. tostring(AuraReadsTrusted(FB.defByKey.EXP)))
+    if C_Secrets then
+      local function Show(label, fn, ...)
+        if type(fn) ~= "function" then out("  " .. label .. ": API missing"); return end
+        local ok, value = pcall(fn, ...)
+        out("  " .. label .. ": " .. (ok and (IsSecretValue(value) and "<secret>" or tostring(value))
+          or ("error " .. tostring(value))))
+      end
+      Show("C_Secrets.ShouldAurasBeSecret()", C_Secrets.ShouldAurasBeSecret)
+      Show("C_Secrets.ShouldSpellAuraBeSecret(Expose Armor)", C_Secrets.ShouldSpellAuraBeSecret, 11198)
+      Show("C_Secrets.GetSpellAuraSecrecy(Expose Armor)", C_Secrets.GetSpellAuraSecrecy, 11198)
+    else
+      out("  C_Secrets namespace missing on this client")
+    end
+    local pendingCount = 0
+    for _ in pairs(FB.pending) do pendingCount = pendingCount + 1 end
+    out("pending casts: " .. pendingCount)
+    for defKey, status in pairs(FB.nativeStatus) do
+      out(defKey .. " engine overlay active=" .. tostring(status.active))
+      for _, line in ipairs(status.steps) do out("  " .. line) end
+    end
+    local seen = {}
+    for defKey in pairs(db.verifiedAuras or {}) do table.insert(seen, defKey) end
+    out("debuffs confirmed readable at least once: " .. (#seen > 0 and table.concat(seen, ",") or "none"))
   elseif cmd == "width" and tonumber(val) then db.width = tonumber(val); Layout()
   elseif cmd == "height" and tonumber(val) then db.height = tonumber(val); Layout()
   elseif cmd == "options" then
@@ -1473,6 +1953,6 @@ SlashCmdList["ROGUETIMER"] = function(msg)
     FB.anchor:ClearAllPoints()
     FB.anchor:SetPoint("CENTER", UIParent, "CENTER", 0, -100)
   else
-    DEFAULT_CHAT_FRAME:AddMessage("Roguetimer: /roguetimer options | unlock | lock | debug | status | width N | height N | center")
+    DEFAULT_CHAT_FRAME:AddMessage("Roguetimer: /roguetimer options | unlock | lock | debug | status | native [on|off] | width N | height N | center")
   end
 end
