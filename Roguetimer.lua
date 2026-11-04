@@ -18,7 +18,7 @@ local DEFS = {
   { key = "RUP", tex = "Ability_Rogue_Rupture", spellIDs = { 1943, 8639, 8640, 11273, 11274, 11275 }, color = { 1.00, 0.30, 0.30 }, finisher = true, scaled = true, verify = true },
   { key = "EXP", tex = "Ability_Warrior_Riposte", spellIDs = { 8647, 8649, 8650, 11197, 11198 }, color = { 0.45, 0.55, 0.80 }, finisher = true, scaled = true, verify = true, native = true },
   { key = "GAR", tex = "Ability_Rogue_Garrote", spellIDs = { 703, 8631, 8632, 8633, 11289, 11290, 26839, 26884 }, color = { 0.55, 0.05, 0.05 }, fixed = 18, finisher = true, defaultEnabled = false, verify = true },
-  { key = "VEN", tex = "INV_Sword_31", spellIDs = { 1310703 }, spellName = "Venom", color = { 0.25, 0.82, 0.30 }, finisher = true, scaled = true, playerTimer = true, defaultEnabled = false },
+  { key = "VEN", tex = "INV_Sword_31", spellName = "Shank", color = { 0.25, 0.82, 0.30 }, finisher = true, scaled = true, playerTimer = true, defaultEnabled = false },
 }
 
 local DEFAULTS = {
@@ -39,6 +39,7 @@ local FB = {
   bars = {},
   sndBonus = 0,
   sndTalentPoints = 0,
+  hasBloodSplatter = false,
   options = {},
   pendingCP = 0,
   pendingTarget = nil,
@@ -196,9 +197,10 @@ end
 local function Duration(def, cp)
   cp = math.max(0, math.min(5, cp or 0))
   if def.key == "SND" then return (6 + 3 * cp) * (1 + FB.sndBonus)
-  elseif def.key == "RUP" then return 6 + 2 * cp
+  elseif def.key == "RUP" then return 6 + 2 * cp + (FB.hasBloodSplatter and 6 or 0)
   elseif def.key == "EXP" then return 30
-  elseif def.key == "VEN" then return 6 + 3 * cp
+  elseif def.key == "VEN" then return 6
+  elseif def.key == "GAR" then return def.fixed + (FB.hasBloodSplatter and 9 or 0)
   else return def.fixed end
 end
 
@@ -521,31 +523,60 @@ local function DebugInitialization()
     table.insert(states, tostring(bar.def.key) .. "=" .. tostring(isShown))
   end
   DEFAULT_CHAT_FRAME:AddMessage(string.format(
-    "Roguetimer debug: initialized=true anchorShown=%s barsCreated=%d barsShown=%d sndTalentPoints=%d {%s}",
+    "Roguetimer debug: initialized=true anchorShown=%s barsCreated=%d barsShown=%d sndTalentPoints=%d bloodSplatter=%s {%s}",
     tostring(FB.anchor and FB.anchor:IsShown() or false),
-    count, shown, FB.sndTalentPoints, table.concat(states, ",")))
+    count, shown, FB.sndTalentPoints, tostring(FB.hasBloodSplatter), table.concat(states, ",")))
+end
+
+local function SpellName(spellID)
+  if C_Spell and type(C_Spell.GetSpellInfo) == "function" then
+    local ok, info = pcall(C_Spell.GetSpellInfo, spellID)
+    if ok and type(info) == "table" and type(info.name) == "string" then
+      return info.name
+    elseif not ok then
+      ReportApiError("C_Spell.GetSpellInfo", info)
+    end
+  end
+  if type(GetSpellInfo) == "function" then
+    local ok, name = pcall(GetSpellInfo, spellID)
+    if ok then
+      return name
+    else
+      ReportApiError("GetSpellInfo", name)
+    end
+  end
+end
+
+local function IsBloodSplatterTalent(name)
+  if type(name) ~= "string" then return false end
+  name = string.lower(name)
+  return name == "blood splatter" or name == "bloot splatter"
 end
 
 local function ScanTalents()
   FB.sndBonus = 0
   FB.sndTalentPoints = 0
+  FB.hasBloodSplatter = false
   if type(GetNumTalents) == "function" and type(GetTalentInfo) == "function" then
     for tab = 1, 3 do
       local count = GetNumTalents(tab)
       if type(count) == "number" then
         for i = 1, count do
-          local _, icon, _, _, rank = GetTalentInfo(tab, i)
+          local name, icon, _, _, rank = GetTalentInfo(tab, i)
           if type(icon) == "string"
             and string.find(string.lower(icon), "ability_rogue_slicedice", 1, true)
             and type(rank) == "number" then
             FB.sndTalentPoints = rank
+          end
+          if IsBloodSplatterTalent(name) and type(rank) == "number" and rank > 0 then
+            FB.hasBloodSplatter = true
           end
         end
       end
     end
   end
 
-  if FB.sndTalentPoints == 0 and C_ClassTalents and C_Traits
+  if C_ClassTalents and C_Traits
     and type(C_ClassTalents.GetActiveConfigID) == "function"
     and type(C_Traits.GetConfigInfo) == "function"
     and type(C_Traits.GetTreeNodes) == "function"
@@ -574,6 +605,10 @@ local function ScanTalents()
                 and C_Traits.GetDefinitionInfo(entryInfo.definitionID)
               if definitionInfo and talentSpellIDs[definitionInfo.spellID] then
                 FB.sndTalentPoints = nodeInfo.ranksPurchased
+              end
+              if definitionInfo and nodeInfo.ranksPurchased > 0
+                and IsBloodSplatterTalent(SpellName(definitionInfo.spellID)) then
+                FB.hasBloodSplatter = true
               end
             end
           end
@@ -604,23 +639,7 @@ local function TrackFinisherCast(unit, castGUID, spellID)
     if def then break end
   end
   if not def and type(spellID) == "number" then
-    local spellName
-    if C_Spell and type(C_Spell.GetSpellInfo) == "function" then
-      local ok, info = pcall(C_Spell.GetSpellInfo, spellID)
-      if ok and type(info) == "table" then
-        spellName = info.name
-      elseif not ok then
-        ReportApiError("C_Spell.GetSpellInfo", info)
-      end
-    end
-    if not spellName and type(GetSpellInfo) == "function" then
-      local ok, name = pcall(GetSpellInfo, spellID)
-      if ok then
-        spellName = name
-      else
-        ReportApiError("GetSpellInfo", name)
-      end
-    end
+    local spellName = SpellName(spellID)
     if type(spellName) == "string" then
       for _, candidate in ipairs(DEFS) do
         if candidate.spellName and string.lower(spellName) == string.lower(candidate.spellName) then
@@ -1742,6 +1761,7 @@ RegisterEvent("PLAYER_TARGET_CHANGED")
 RegisterEvent("ZONE_CHANGED_NEW_AREA")
 RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 RegisterEvent("PLAYER_TALENT_UPDATE")
+RegisterEvent("TRAIT_CONFIG_UPDATED")
 do
   local registered = type(ev.RegisterUnitEvent) == "function"
     and pcall(ev.RegisterUnitEvent, ev, "UNIT_AURA", "target")
@@ -1867,7 +1887,7 @@ local function HandleEvent(self, e, a1, ...)
     TrackComboPoints()
     DebugMessage("target changed: " .. tostring(FB.lastTargetKey))
     UpdateBars()
-  elseif e == "PLAYER_TALENT_UPDATE" then
+  elseif e == "PLAYER_TALENT_UPDATE" or e == "TRAIT_CONFIG_UPDATED" then
     ScanTalents()
   elseif e == "UNIT_AURA" then
     if not IsSecretValue(a1) and a1 == "target" then ResolvePending() end

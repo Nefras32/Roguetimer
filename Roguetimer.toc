@@ -2,7 +2,7 @@
 ## Title: Roguetimer
 ## Notes: Tracks Rogue finishers including Venom, with customizable bars and an optional Slice and Dice refresh-efficiency prediction.
 ## Author: -
-## Version: 0.4
+## Version: 0.4.1
 ## SavedVariables: RoguetimerDB, ForeverBarsDB
 ## IconTexture: Interface\AddOns\Roguetimer\roguetimer.png
 
