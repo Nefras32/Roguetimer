@@ -29,6 +29,7 @@ local DEFAULTS = {
   showInactive = true,
   showIcons = true,
   showSnDEfficiency = true,
+  hideOutOfCombat = false,
   nativeOverlay = true,   -- engine-drawn Expose Armor overlay; "/roguetimer native off" disables it
   colors = {},
 }
@@ -260,6 +261,15 @@ local function UnitTimerKey(unit)
     end
   end
   return "target:" .. FB.targetGeneration
+end
+
+local function IsPlayerInCombat()
+  if FB.inCombat ~= nil then return FB.inCombat end
+  if type(UnitAffectingCombat) ~= "function" then return true end
+  local ok, value = pcall(UnitAffectingCombat, "player")
+  -- An unreadable answer must never hide the bars.
+  if not ok or IsSecretValue(value) then return true end
+  return value == true
 end
 
 local function IsInBattleground()
@@ -1024,7 +1034,7 @@ local function CreateOptions()
   local panel = CreateFrame("Frame", "RoguetimerOptions", UIParent)
   FB.options = panel
   panel:SetWidth(440)
-  panel:SetHeight(480)
+  panel:SetHeight(505)
   panel:SetFrameStrata("DIALOG")
   panel:SetClampedToScreen(true)
   panel:EnableMouse(true)
@@ -1277,6 +1287,9 @@ local function CreateOptions()
   sndEfficiencyToggle:SetScript("OnLeave", function()
     if GameTooltip then GameTooltip:Hide() end
   end)
+  AddToggle("Hide bars out of combat", -310,
+    function() return RoguetimerDB.hideOutOfCombat end,
+    function(value) RoguetimerDB.hideOutOfCombat = value end)
 
   local function AddSizeControl(label, y, key, minimum, maximum, step)
     local text = panel:CreateFontString(nil, "OVERLAY")
@@ -1301,12 +1314,12 @@ local function CreateOptions()
     plus:SetScript("OnClick", function() Adjust(1) end)
   end
 
-  AddSizeControl("Bar width", -322, "width", 100, 420, 20)
-  AddSizeControl("Bar height", -348, "height", 12, 36, 2)
+  AddSizeControl("Bar width", -347, "width", 100, 420, 20)
+  AddSizeControl("Bar height", -373, "height", 12, 36, 2)
 
-  AddSectionHeading("BAR POSITION", -378)
+  AddSectionHeading("BAR POSITION", -403)
   local lock = CreatePanelButton(panel, "", 184, 26)
-  lock:SetPoint("TOPLEFT", panel, "TOPLEFT", 18, -396)
+  lock:SetPoint("TOPLEFT", panel, "TOPLEFT", 18, -421)
   local function RefreshLock()
     lock:SetText(RoguetimerDB.locked and "Unlock Position" or "Lock Position")
   end
@@ -1338,15 +1351,15 @@ local function CreateOptions()
   end
 
   local centerVertical = CreatePanelButton(panel, "Center Vertically", 184, 26)
-  centerVertical:SetPoint("TOPLEFT", panel, "TOPLEFT", 18, -428)
+  centerVertical:SetPoint("TOPLEFT", panel, "TOPLEFT", 18, -453)
   centerVertical:SetScript("OnClick", function() CenterAnchor("vertical") end)
 
   local centerHorizontal = CreatePanelButton(panel, "Center Horizontally", 184, 26)
-  centerHorizontal:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -18, -428)
+  centerHorizontal:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -18, -453)
   centerHorizontal:SetScript("OnClick", function() CenterAnchor("horizontal") end)
 
   local resetPosition = CreatePanelButton(panel, "Reset Position", 184, 26)
-  resetPosition:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -18, -396)
+  resetPosition:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -18, -421)
   resetPosition:SetScript("OnClick", function()
     RoguetimerDB.x, RoguetimerDB.y = nil, nil
     FB.anchor:ClearAllPoints()
@@ -1477,6 +1490,11 @@ end
 
 UpdateBars = function()
   local db = RoguetimerDB
+  -- Bars stay visible while unlocked so they can still be positioned out of combat.
+  if db.hideOutOfCombat and db.locked and not IsPlayerInCombat() then
+    FB.anchor:Hide()
+    return
+  end
   FB.anchor:Show()
   local now = GetTime()
   local W = db.width
@@ -1762,6 +1780,8 @@ RegisterEvent("ZONE_CHANGED_NEW_AREA")
 RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 RegisterEvent("PLAYER_TALENT_UPDATE")
 RegisterEvent("TRAIT_CONFIG_UPDATED")
+RegisterEvent("PLAYER_REGEN_DISABLED")
+RegisterEvent("PLAYER_REGEN_ENABLED")
 do
   local registered = type(ev.RegisterUnitEvent) == "function"
     and pcall(ev.RegisterUnitEvent, ev, "UNIT_AURA", "target")
@@ -1834,6 +1854,9 @@ local function HandleEvent(self, e, a1, ...)
     if type(RoguetimerDB.showSnDEfficiency) ~= "boolean" then
       RoguetimerDB.showSnDEfficiency = DEFAULTS.showSnDEfficiency
     end
+    if type(RoguetimerDB.hideOutOfCombat) ~= "boolean" then
+      RoguetimerDB.hideOutOfCombat = DEFAULTS.hideOutOfCombat
+    end
     if RoguetimerDB.settingsVersion < 4 then
       -- Keep bars at their old screen position when reserving space for hidden icons.
       if not RoguetimerDB.showIcons and type(RoguetimerDB.x) == "number" then
@@ -1889,6 +1912,9 @@ local function HandleEvent(self, e, a1, ...)
     UpdateBars()
   elseif e == "PLAYER_TALENT_UPDATE" or e == "TRAIT_CONFIG_UPDATED" then
     ScanTalents()
+  elseif e == "PLAYER_REGEN_DISABLED" or e == "PLAYER_REGEN_ENABLED" then
+    FB.inCombat = e == "PLAYER_REGEN_DISABLED"
+    UpdateBars()
   elseif e == "UNIT_AURA" then
     if not IsSecretValue(a1) and a1 == "target" then ResolvePending() end
   elseif e == "UNIT_SPELLCAST_SUCCEEDED" then
@@ -1966,6 +1992,14 @@ SlashCmdList["ROGUETIMER"] = function(msg)
     out("debuffs confirmed readable at least once: " .. (#seen > 0 and table.concat(seen, ",") or "none"))
   elseif cmd == "width" and tonumber(val) then db.width = tonumber(val); Layout()
   elseif cmd == "height" and tonumber(val) then db.height = tonumber(val); Layout()
+  elseif cmd == "combat" then
+    if val == "on" or val == "off" then
+      db.hideOutOfCombat = val == "on"
+    else
+      db.hideOutOfCombat = not db.hideOutOfCombat
+    end
+    DEFAULT_CHAT_FRAME:AddMessage("Roguetimer: hide out of combat " .. (db.hideOutOfCombat and "enabled" or "disabled"))
+    UpdateBars()
   elseif cmd == "options" then
     FB.openOptions()
   elseif cmd == "reset" or cmd == "center" then
@@ -1973,6 +2007,6 @@ SlashCmdList["ROGUETIMER"] = function(msg)
     FB.anchor:ClearAllPoints()
     FB.anchor:SetPoint("CENTER", UIParent, "CENTER", 0, -100)
   else
-    DEFAULT_CHAT_FRAME:AddMessage("Roguetimer: /roguetimer options | unlock | lock | debug | status | native [on|off] | width N | height N | center")
+    DEFAULT_CHAT_FRAME:AddMessage("Roguetimer: /roguetimer options | unlock | lock | debug | status | native [on|off] | combat [on|off] | width N | height N | center")
   end
 end
