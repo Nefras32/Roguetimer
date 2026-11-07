@@ -1278,21 +1278,51 @@ local function CreateOptions()
     if GameTooltip then GameTooltip:Hide() end
   end)
 
-  local function AddSizeControl(label, y, key, minimum, maximum, step)
+  local function AddSizeControl(label, y, key, minimum, maximum)
     local text = panel:CreateFontString(nil, "OVERLAY")
     text:SetPoint("TOPLEFT", panel, "TOPLEFT", 24, y)
     SetOptionText(text, label, 12)
-    local value = panel:CreateFontString(nil, "OVERLAY")
-    value:SetWidth(42)
+    local value = CreateFrame("EditBox", nil, panel, "InputBoxTemplate")
+    value:SetSize(48, 22)
+    value:SetAutoFocus(false)
+    value:SetNumeric(true)
+    value:SetMaxLetters(3)
     value:SetJustifyH("CENTER")
-    SetOptionText(value, tostring(RoguetimerDB[key]), 12)
+    value:SetFont(STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF", 12, "")
+    value:SetText(tostring(RoguetimerDB[key]))
     local minus = CreatePanelButton(panel, "-", 24, 22)
     local plus = CreatePanelButton(panel, "+", 24, 22)
     plus:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -18, y + 1)
     value:SetPoint("RIGHT", plus, "LEFT", -6, 0)
     minus:SetPoint("RIGHT", value, "LEFT", -6, 0)
+
+    local function CommitValue()
+      local entered = tonumber(value:GetText())
+      if not entered then
+        value:SetText(tostring(RoguetimerDB[key]))
+        return
+      end
+      local adjusted = math.max(minimum, math.min(maximum, math.floor(entered)))
+      local changed = RoguetimerDB[key] ~= adjusted
+      RoguetimerDB[key] = adjusted
+      value:SetText(tostring(adjusted))
+      if changed then
+        Layout()
+        UpdateBars()
+      end
+    end
+    value:SetScript("OnEnterPressed", function(self)
+      CommitValue()
+      self:ClearFocus()
+    end)
+    value:SetScript("OnEditFocusLost", CommitValue)
+    value:SetScript("OnEscapePressed", function(self)
+      self:SetText(tostring(RoguetimerDB[key]))
+      self:ClearFocus()
+    end)
+
     local function Adjust(direction)
-      RoguetimerDB[key] = math.max(minimum, math.min(maximum, RoguetimerDB[key] + step * direction))
+      RoguetimerDB[key] = math.max(minimum, math.min(maximum, RoguetimerDB[key] + direction))
       value:SetText(tostring(RoguetimerDB[key]))
       Layout()
       UpdateBars()
@@ -1301,8 +1331,8 @@ local function CreateOptions()
     plus:SetScript("OnClick", function() Adjust(1) end)
   end
 
-  AddSizeControl("Bar width", -322, "width", 100, 420, 20)
-  AddSizeControl("Bar height", -348, "height", 12, 36, 2)
+  AddSizeControl("Bar width", -322, "width", 100, 420)
+  AddSizeControl("Bar height", -348, "height", 12, 36)
 
   AddSectionHeading("BAR POSITION", -378)
   local lock = CreatePanelButton(panel, "", 184, 26)
@@ -1359,7 +1389,7 @@ local function CreateOptions()
   FB.openOptions = OpenOptions
 
   if Minimap then
-    local button = CreateFrame("Button", "RoguetimerMinimapButton", UIParent)
+    local button = CreateFrame("Button", "RoguetimerMinimapButton", Minimap)
     FB.minimapButton = button
     button:SetWidth(32)
     button:SetHeight(32)
